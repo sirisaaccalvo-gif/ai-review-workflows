@@ -40,6 +40,14 @@ jobs:
             echo "syntax ok: $f"
           done
 
+      - name: No private names in files or commit messages
+        # This repo was rebuilt from scratch three times because private
+        # repository names leaked into it, twice via the commit messages of the
+        # commits doing the scrubbing. A one-time cleanup does not hold. The
+        # denylist holds hashes, never the names, so the guard can detect what
+        # it must not reveal.
+        run: node scripts/check-disclosure.mjs
+
       - name: Verify the central asset hash
         # The workflow refuses to run assets that do not match this literal, so
         # a change under scripts/ or prompts/ without a matching bump would

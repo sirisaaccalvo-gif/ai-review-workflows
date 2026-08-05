@@ -1,0 +1,12 @@
+# SHA-256 of lowercased private names this public repo must never contain.
+# The names are deliberately absent: a literal denylist would BE the disclosure.
+# Add one with: node scripts/check-disclosure.mjs --hash <name>
+# Three rebuilds of this repo were caused by these names reaching commit messages.
+
+58acee778ce61c5ec16bf965720bee4f142e8e9b5fe8da42eb6c599536b2f017
+d574987db31c6efe911caecd000a3fafac07fccf91fef8fdbd5b71565c54a2e5
+ee1021f5e13a2c4c6dc0dffb357f00a4e362d18b2046f399745f31d34e078bd0
+0e36eaff005792a74d9b4c0052b86b6c2bd8e79be53570416b887ebdb2e62975
+644f973a1fd55271bc693950efb88420aba449fcde66e15c1256494dfa260d31
+dffd4e579c2622f375df227d4f04b5fa2ab10c3a5df3ccfe62a24899c9c65153
+32525861d97fb427480e08eb98f31e056e3a6a57e1c14729e45ebcbd2769e8dc

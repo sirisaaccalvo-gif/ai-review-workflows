@@ -1,0 +1,12 @@
+# Actions only. There is no package ecosystem here on purpose: the digest
+# script is stdlib plus native fetch, so there is no lockfile to update and no
+# transitive dependency to audit.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: chore
+    labels: [dependencies]

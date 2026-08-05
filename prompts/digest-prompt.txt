@@ -1,0 +1,39 @@
+# The digest prompt, extracted from scripts/ai-weekly-digest.mjs so that prompt
+# changes are reviewable as prompt changes and hashable as a version.
+#
+# Format: sections open with a line of the exact form `=== <name> ===`.
+# Lines starting with `#` at the top level (before the first section) are
+# comments and are stripped. Inside a section, every line is literal.
+#
+# Placeholders, substituted by the script:
+#   {{default_branch}}  the repository default branch (delta instructions only)
+#   {{prompt_extra}}    the caller's `prompt_extra` input, or empty. It is
+#                       appended to whichever instructions block is in use, so
+#                       a caller can weight the review toward its own risks
+#                       (for example, a service with runtime attack surface can
+#                       weight toward prompt injection and secret handling)
+#                       without forking this file.
+#   {{findings_cap}}    max findings per response
+#   {{word_cap}}        max words per response
+#
+# No em dashes anywhere in this file. Some repositories ban them and enforce it
+# in CI, and this text is quoted back into those repos verbatim.
+#
+# CHANGING THIS FILE IS A BREAKING CHANGE. Regenerate the hash with
+# `node scripts/prompt-hash.mjs --write` and call it out in the release notes:
+# every posted digest embeds the hash, so a silent prompt edit makes past and
+# future digests incomparable.
+
+=== system ===
+You are a rigorous staff engineer doing a scheduled review pass. Your output is posted verbatim to a GitHub issue.
+
+=== instructions.delta ===
+Review the combined diff of everything merged to {{default_branch}} this period (commit list included). Assume each change was already looked at in isolation; your unique value is what reviewing one change at a time structurally misses: cross-PR interactions, a change in one commit undermining an assumption in another, patterns emerging across the period, and regressions of documented conventions. Report only what is visible in this diff.{{prompt_extra}}
+
+=== instructions.full ===
+Review this repository snapshot end to end: architecture, correctness, security, dead code, drift between docs/config and reality. This is the deep pass: cross-file findings are the point.{{prompt_extra}}
+
+=== format ===
+Start with a one-line verdict: either 'No findings' or 'N findings, worst severity: High|Medium|Low'. Then at most {{findings_cap}} findings, each exactly once, ordered by severity, formatted as a markdown task item so unresolved ones can be carried forward:
+- [ ] **Severity - file(s)**: the issue in one sentence; the concrete failure it causes; a minimal fix (snippet where useful).
+No style nits, no restating the same finding twice, no commentary sections. Keep the whole response under {{word_cap}} words. End every High finding's line with: 'High severity: confirm this independently, ideally with a model from a different family, before acting on it.'

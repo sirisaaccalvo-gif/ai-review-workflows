@@ -1,0 +1,94 @@
+# Caller stub: copy to .github/workflows/ai-digest.yml in the consuming repo.
+#
+# Everything below the `uses:` line is the entire local footprint of the digest.
+# The script, the prompt, the model plumbing, and the state machine live in
+# ai-review-workflows.
+#
+# Before this works, the consuming repo needs:
+#   - the secrets it maps below, under Settings, Secrets and variables, Actions
+#   - nothing else. No script, no node_modules, no lockfile.
+
+name: AI digest
+
+on:
+  schedule:
+    # If you run this in several repos, stagger the minute so they never
+    # contend for the same slot.
+    #
+    # GitHub disables scheduled workflows after 60 days with no repository
+    # activity, and does it silently. On a low-activity repo the digest can stop
+    # without any failure to notice. The heartbeat (a digest posts on quiet
+    # months too, with no API call) is what makes a missing post readable as a
+    # broken cron rather than a quiet month, but nothing re-enables the cron for
+    # you: if a month goes by with no comment at all on the rolling issue, check
+    # whether Actions disabled the schedule.
+    # Monthly, on the 1st. The default issue title still says "weekly" for
+    # historical reasons; it is an identifier, not a description, and renaming
+    # it on a live repo orphans the cursor.
+    - cron: '0 15 1 * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "delta = merged changes since the last digest; full = whole-repo deep scan"
+        type: choice
+        options: [delta, full]
+        default: delta
+      post:
+        description: "Post to the rolling issue (false = dry run to job summary)"
+        type: boolean
+        default: true
+      include_docs:
+        description: "full mode only: also include docs paths (prose)"
+        type: boolean
+        default: false
+
+# REQUIRED, and required HERE. A called workflow can only narrow the caller's
+# GITHUB_TOKEN, never widen it, so the reusable workflow's own permissions block
+# cannot grant issues: write on its own. Omit this and the digest fails at post
+# time with a 403, after paying for the model call.
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  digest:
+    # PIN TO A FULL COMMIT SHA, never a tag or a branch. A tag is a mutable
+    # pointer; pinning to one means a force-pushed tag silently changes what
+    # runs against your repo with your API keys. The `# v1.0.0` comment is for
+    # humans and for Dependabot, which updates the SHA and the comment together.
+    uses: sirisaaccalvo-gif/ai-review-workflows/.github/workflows/ai-digest.yml@REPLACE_WITH_FULL_COMMIT_SHA # v1.0.0
+    with:
+      # THE SAME SHA as the `uses:` line above. The workflow file and the
+      # script it runs are versioned together, so fetching the script from a
+      # moving ref while pinning the workflow would pair a pinned harness with
+      # whatever the assets happen to be today. Set both, always, to the same
+      # value. If they ever disagree, the asset-hash check fails the job rather
+      # than running a mismatched pair, so a stale copy of one is loud.
+      central_ref: REPLACE_WITH_FULL_COMMIT_SHA
+      mode: ${{ inputs.mode }}
+      post: ${{ github.event_name == 'schedule' || inputs.post }}
+      include_docs: ${{ inputs.include_docs == true }}
+      # Everything else uses the central defaults: GPT-5.6 Terra for delta,
+      # Kimi K3 at max reasoning for full. Override per repo as needed, e.g.
+      #   delta_provider: moonshot     # flip delta to the other family
+      #   delta_model: kimi-k3
+      #   delta_model_label: Kimi K3
+      #   docs_paths: 'docs/'          # narrow the prose paths for this repo
+      #   prompt_extra: 'This codebase has runtime attack surface: weight the
+      #     review toward prompt-injection paths, secret and credential
+      #     handling, input validation, and authentication logic.'
+    secrets:
+      # Explicit mapping, never `secrets: inherit`. inherit would hand every
+      # secret this repo holds to a workflow defined in another repository;
+      # these two are the only ones the digest can use, and a reader of this
+      # file can see that without leaving it.
+      #
+      # Map only what your modes actually need. A repo whose delta and full
+      # modes both run on Moonshot does not need OPENAI_API_KEY at all.
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+      # Not needed against the public ai-review-workflows. Only uncomment if
+      # you point this stub at a PRIVATE copy: a repo's GITHUB_TOKEN is scoped
+      # to itself and cannot clone a different private repo, which the digest
+      # must do to fetch the script at the pinned SHA.
+      # CENTRAL_REPO_TOKEN: ${{ secrets.CENTRAL_REPO_TOKEN }}

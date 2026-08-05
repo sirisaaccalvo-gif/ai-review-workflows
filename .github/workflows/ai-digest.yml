@@ -1,0 +1,623 @@
+# The AI code digest, as a reusable workflow.
+#
+# A calling repository gets a scheduled cross-family review of everything that
+# merged since the last digest, posted to one rolling issue, plus an on-demand
+# whole-repo deep scan. The caller keeps a ~30 line stub; everything else lives
+# here. See examples/caller-stub.yml and README.md.
+#
+# Design invariants that are load bearing, do not "simplify" them away:
+#
+#   1. Version coherency, by CONTENT not by ref. A called reusable workflow
+#      cannot discover its own origin: job_workflow_ref and job_workflow_sha are
+#      both empty in a real cross-repo call (measured), and workflow_ref is the
+#      caller's. So this job fetches the assets from an explicit repo and ref,
+#      then refuses to run unless they hash to EXPECTED_ASSETS_SHA256, a literal
+#      in this file. The caller's SHA pin fixes that literal, and the literal
+#      fixes the code. A moved tag or force-pushed branch fails closed.
+#   2. Two checkouts, explicit workdirs. The CALLER's source is at
+#      github.workspace with fetch-depth: 0 (the delta base is an arbitrary past
+#      SHA and a shallow clone resolves it to nothing, which reads as a
+#      permanently quiet period). This repo's assets are at _central/. The
+#      script never trusts process.cwd(): DIGEST_CALLER_DIR scopes every git and
+#      file read.
+#   3. Secrets are explicit. No secrets: inherit. Callers map only the keys they
+#      actually use, and this repo never stores a secret of its own.
+#   4. Endpoints are inputs, not a base-URL free-for-all: a caller picks from
+#      its own stub which API each mode talks to, and that choice is visible in
+#      the stub's diff.
+#
+# Do not reintroduce a github.job_workflow_* lookup here. Both values were
+# measured empty in a live cross-repo call, and an earlier version of this file
+# branched on them, silently checked out the CALLING repository into _central,
+# and failed only because the asset filenames did not match.
+#
+# No em dashes anywhere in this file, so its text can be pasted or quoted into
+# repositories whose style rules ban them.
+
+name: AI digest
+
+on:
+  workflow_call:
+    inputs:
+      # Numeric knobs are declared as strings on purpose: an omitted `number`
+      # input arrives as 0, which is indistinguishable from a deliberate 0 and
+      # would silently override a default. Empty string means "use the default",
+      # and the defaults live in exactly one place (the Resolve step below).
+      central_repo:
+        description: "Where the digest assets live. Only change this if you run your own copy of this repo. Integrity does not rest on this value: the job verifies the fetched assets against a hash baked into this workflow file."
+        type: string
+        required: false
+      central_ref:
+        description: "REQUIRED. The same commit SHA you pinned the uses: line to. Deliberately has no default: defaulting to a branch would let a caller pin the workflow and silently track the latest script, which is the exact split this design exists to prevent. A caller that omits it fails immediately with a clear message instead of breaking later."
+        type: string
+        required: true
+      mode:
+        description: "delta (merged changes since the last digest) or full (whole-repo deep scan). Default delta."
+        type: string
+        required: false
+      post:
+        description: "Post to the rolling issue. false = dry run to the job summary."
+        type: boolean
+        required: false
+        default: true
+      include_docs:
+        description: "full mode only: also include the docs_paths prefixes (prose)."
+        type: boolean
+        required: false
+        default: false
+
+      delta_model_label:
+        description: "Human label for the delta model, shown in the digest header. Default 'GPT-5.6 Terra'."
+        type: string
+        required: false
+      delta_provider:
+        description: "openai or moonshot. Selects BOTH the hardcoded endpoint and the secret used. There is deliberately no base-URL input: a free-form endpoint would let a stub edit point a live API key at an arbitrary host. Default openai."
+        type: string
+        required: false
+      delta_model:
+        description: "Delta model id. Default gpt-5.6-terra."
+        type: string
+        required: false
+      delta_effort:
+        description: "reasoning_effort for delta, or empty to omit the field. Default high."
+        type: string
+        required: false
+      delta_max_completion_tokens:
+        description: "Output ceiling for delta. Default 32768."
+        type: string
+        required: false
+
+      full_model_label:
+        description: "Human label for the full-mode model. Default 'Kimi K3 (max reasoning)'."
+        type: string
+        required: false
+      full_provider:
+        description: "openai or moonshot. Selects BOTH the hardcoded endpoint and the secret used. Default moonshot."
+        type: string
+        required: false
+      full_model:
+        description: "Full-mode model id. Default kimi-k3."
+        type: string
+        required: false
+      full_effort:
+        description: "reasoning_effort for full mode. Default empty: K3's API default IS max, which is the point of full mode."
+        type: string
+        required: false
+      full_max_completion_tokens:
+        description: "Output ceiling for full mode. Default 131072."
+        type: string
+        required: false
+
+      issue_title:
+        description: "Exact title of the rolling issue. Changing it on a live repo orphans that repo's cursor and carried findings. Default '🤖 AI weekly code digest (automated)'."
+        type: string
+        required: false
+      assignee:
+        description: "Login to assign the rolling issue to, so a human is subscribed. Assignment is best effort. Default: the repository owner."
+        type: string
+        required: false
+      docs_paths:
+        description: "Comma separated path prefixes treated as prose and gated behind include_docs. Default 'docs/,.planning/'."
+        type: string
+        required: false
+      binary_extensions:
+        description: "Regex alternation of file extensions excluded from full-mode scans. Default excludes images, fonts, archives, audio and video."
+        type: string
+        required: false
+      prompt_extra:
+        description: "One or two sentences appended to the review instructions, for repo-specific risk weighting. Not a prompt replacement."
+        type: string
+        required: false
+      pricing:
+        description: "JSON object keyed by model id, e.g. {\"kimi-k3\":{\"in\":3,\"out\":15}}, used for the estimated-cost footer. Unpriced models get a disclosed 'not estimated'."
+        type: string
+        required: false
+      warn_input_tokens:
+        description: "Log a warning above this estimated input size. Default 250000."
+        type: string
+        required: false
+      chunk_input_tokens:
+        description: "Split into file-boundary chunks above this estimated input size. Default 700000."
+        type: string
+        required: false
+      client_timeout_ms:
+        description: "Per-attempt client timeout in ms. Default 1800000."
+        type: string
+        required: false
+      bootstrap_window_days:
+        description: "Window used on a first run or an unreachable cursor. Default 31."
+        type: string
+        required: false
+      findings_cap:
+        description: "Max findings per digest. Default 12."
+        type: string
+        required: false
+      word_cap:
+        description: "Max words per digest. Default 2500."
+        type: string
+        required: false
+      node_version:
+        description: "Node major used to run the digest script. Default 24."
+        type: string
+        required: false
+    secrets:
+      OPENAI_API_KEY:
+        description: "Required only if a mode's provider is openai."
+        required: false
+      MOONSHOT_API_KEY:
+        description: "Required only if a mode's provider is moonshot."
+        required: false
+      CENTRAL_REPO_TOKEN:
+        description: "Only needed when the central repo is PRIVATE, i.e. if you run your own copy of this. A caller GITHUB_TOKEN is scoped to the caller and cannot clone another private repo, so invariant 1 above needs a read-only token that can. Callers of the public repo omit this entirely."
+        required: false
+
+  # Direct pokes from this repo. Deliberately only the three inputs a human
+  # would change by hand: workflow_dispatch caps at 10 inputs, and everything
+  # else has a default.
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "delta or full"
+        type: choice
+        options: [delta, full]
+        default: delta
+      post:
+        description: "Post to the rolling issue (false = dry run to job summary)"
+        type: boolean
+        default: true
+      include_docs:
+        description: "full mode only: also include the docs paths"
+        type: boolean
+        default: false
+
+# The caller's workflow-level permissions block is the real ceiling: a called
+# workflow can only narrow the caller's GITHUB_TOKEN, never widen it. Every
+# caller stub must declare exactly this. README documents it verbatim.
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    # Keyed by the CALLING repository: in a called workflow the github context
+    # is the caller's, so separate repos on staggered crons never queue behind
+    # each other, while one repo never runs two digests at once. Never cancel a run
+    # that may be mid-post.
+    concurrency:
+      group: ai-digest-${{ github.repository }}
+      cancel-in-progress: false
+    # A LITERAL, deliberately. `timeout-minutes` is evaluated when GitHub loads
+    # the workflow file, and the `inputs` context does not exist at load time
+    # outside a workflow_call. An expression here made this file fail to load on
+    # every push, in every repo that has it, producing a permanently red run in
+    # the Actions tab that masks real failures. The functional paths still
+    # worked, which is what made it easy to miss.
+    #
+    # Room for one 30-minute max-effort call plus its single retry, plus a
+    # full-history checkout. Kept in lockstep with DIGEST_JOB_BUDGET_MS below,
+    # which is what the script actually plans against: it rescales per-attempt
+    # timeouts to fit that budget, or refuses to start a run that cannot finish.
+    # Change the two together.
+    timeout-minutes: 70
+
+    steps:
+      - name: Resolve configuration
+        id: cfg
+        env:
+          IN_CENTRAL_REPO: ${{ inputs.central_repo }}
+          IN_CENTRAL_REF: ${{ inputs.central_ref }}
+          IN_MODE: ${{ inputs.mode }}
+          IN_DELTA_MODEL_LABEL: ${{ inputs.delta_model_label }}
+          IN_DELTA_PROVIDER: ${{ inputs.delta_provider }}
+          IN_DELTA_MODEL: ${{ inputs.delta_model }}
+          IN_DELTA_EFFORT: ${{ inputs.delta_effort }}
+          IN_DELTA_MAX: ${{ inputs.delta_max_completion_tokens }}
+          IN_FULL_MODEL_LABEL: ${{ inputs.full_model_label }}
+          IN_FULL_PROVIDER: ${{ inputs.full_provider }}
+          IN_FULL_MODEL: ${{ inputs.full_model }}
+          IN_FULL_EFFORT: ${{ inputs.full_effort }}
+          IN_FULL_MAX: ${{ inputs.full_max_completion_tokens }}
+          IN_ISSUE_TITLE: ${{ inputs.issue_title }}
+          IN_ASSIGNEE: ${{ inputs.assignee }}
+          IN_DOCS_PATHS: ${{ inputs.docs_paths }}
+          IN_BINARY_EXTENSIONS: ${{ inputs.binary_extensions }}
+          IN_PROMPT_EXTRA: ${{ inputs.prompt_extra }}
+          IN_PRICING: ${{ inputs.pricing }}
+          IN_WARN: ${{ inputs.warn_input_tokens }}
+          IN_CHUNK: ${{ inputs.chunk_input_tokens }}
+          IN_TIMEOUT_MS: ${{ inputs.client_timeout_ms }}
+          IN_BOOTSTRAP_DAYS: ${{ inputs.bootstrap_window_days }}
+          IN_FINDINGS_CAP: ${{ inputs.findings_cap }}
+          IN_WORD_CAP: ${{ inputs.word_cap }}
+          IN_NODE_VERSION: ${{ inputs.node_version }}
+        run: |
+          set -euo pipefail
+
+          # Every default in this workflow lives here and nowhere else. Declaring
+          # them again as `default:` on the inputs would give workflow_call one
+          # set and the workflow_dispatch path above (which has no such inputs)
+          # another, and they would drift.
+          DEF_MODE=delta
+          DEF_DELTA_MODEL_LABEL='GPT-5.6 Terra'
+          DEF_DELTA_PROVIDER='openai'
+          DEF_DELTA_MODEL='gpt-5.6-terra'
+          DEF_DELTA_EFFORT='high'
+          DEF_DELTA_MAX='32768'
+          DEF_FULL_MODEL_LABEL='Kimi K3 (max reasoning)'
+          DEF_FULL_PROVIDER='moonshot'
+          DEF_FULL_MODEL='kimi-k3'
+          DEF_FULL_MAX='131072'
+          DEF_ISSUE_TITLE='🤖 AI weekly code digest (automated)'
+          DEF_DOCS_PATHS='docs/,.planning/'
+          DEF_BINARY_EXTENSIONS='png|jpe?g|webp|avif|gif|ico|woff2?|ttf|otf|pdf|zip|m4a|mp3|wav|aac|ogg|flac|mp4|m4v|mov|webm|avi'
+          # Estimates for the cost footer, not invoices. Verified 2026-08-04
+          # against the 2026-07-30 OpenAI price cut: Terra is $2.50/$15 per 1M
+          # up to its 272k long-context line and $4/$18 above it (the surcharge
+          # used to double the rate to $5/$22.50). K3 is flat $3/$15 at any
+          # length, which is why full mode runs there. Re-check these at the
+          # these against a real invoice periodically; the footer says "est."
+          # precisely because nothing here models cached-input discounts.
+          DEF_PRICING='{"gpt-5.6-terra":{"in":2.50,"out":15.00,"long_in":4.00,"long_out":18.00,"long_threshold":272000},"kimi-k3":{"in":3.00,"out":15.00}}'
+          # 250k is a context-QUALITY line first and a billing line second: an
+          # input this size loses recall through its middle long before the
+          # (now much smaller) long-context surcharge matters. 700k is the
+          # single-call ceiling before file-boundary chunking.
+          DEF_WARN='250000'
+          DEF_CHUNK='700000'
+          DEF_TIMEOUT_MS='1800000'
+          DEF_BOOTSTRAP_DAYS='31'
+          DEF_FINDINGS_CAP='12'
+          DEF_WORD_CAP='2500'
+          DEF_NODE_VERSION='24'
+          DEF_CENTRAL_REPO='sirisaaccalvo-gif/ai-review-workflows'
+
+          # Multi-line safe. A plain `NAME=value` line would let any input
+          # containing a newline write arbitrary extra variables into the job
+          # environment, so values go through a heredoc.
+          #
+          # The delimiter is randomized per run AND validated, because a fixed
+          # delimiter only moves the problem: an input whose value contains that
+          # exact line closes the heredoc early and everything after it is read
+          # back as more GITHUB_ENV entries. Verified reproducible before this
+          # guard existed. Randomizing makes it unguessable; the explicit check
+          # makes it impossible rather than merely unlikely, and fails loudly
+          # instead of silently truncating a value.
+          DELIM="__DIGEST_$(openssl rand -hex 16)__"
+          put() {
+            case "$2" in
+              *"$DELIM"*)
+                echo "::error::input $1 contains the generated heredoc delimiter; refusing to write it to the environment"
+                exit 1 ;;
+            esac
+            printf '%s<<%s\n%s\n%s\n' "$1" "$DELIM" "$2" "$DELIM" >> "$GITHUB_ENV"
+          }
+          pick() { if [ -n "${1:-}" ]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
+
+          # Validate a value against an ERE, rejecting multiline values FIRST.
+          #
+          # grep is line oriented: `grep -Eq '^x$'` succeeds if ANY line matches,
+          # so a value like "owner/repo\nkey_env=..." satisfies a pattern that
+          # looks anchored and then injects a second GITHUB_OUTPUT record. Every
+          # validator in this step goes through here, and anything added later
+          # must too.
+          #
+          # Newlines are rejected explicitly rather than with `grep -z`: that
+          # flag means null-data in GNU grep but something else in other greps,
+          # so a -z based guard is only as portable as the runner image. The
+          # value arrives on stdin, so a leading dash can never be read as a
+          # grep option.
+          matches() {
+            [ "$(printf '%s' "$1" | wc -l | tr -d '[:space:]')" = "0" ] || return 1
+            case "$1" in *"$(printf '\r')"*) return 1 ;; esac
+            printf '%s' "$1" | grep -Eq "$2"
+          }
+
+          MODE="$(pick "${IN_MODE:-}" "$DEF_MODE")"
+          case "$MODE" in
+            delta|full) ;;
+            *) echo "::error::mode must be 'delta' or 'full', got '$MODE'"; exit 1 ;;
+          esac
+
+          if [ "$MODE" = full ]; then
+            MODEL_LABEL="$(pick "${IN_FULL_MODEL_LABEL:-}" "$DEF_FULL_MODEL_LABEL")"
+            PROVIDER="$(pick "${IN_FULL_PROVIDER:-}" "$DEF_FULL_PROVIDER")"
+            MODEL_ID="$(pick "${IN_FULL_MODEL:-}" "$DEF_FULL_MODEL")"
+            # No default: an empty full_effort is the intended state, since the
+            # full-mode model's API default already is maximum effort.
+            EFFORT="${IN_FULL_EFFORT:-}"
+            MAX_TOKENS="$(pick "${IN_FULL_MAX:-}" "$DEF_FULL_MAX")"
+          else
+            MODEL_LABEL="$(pick "${IN_DELTA_MODEL_LABEL:-}" "$DEF_DELTA_MODEL_LABEL")"
+            PROVIDER="$(pick "${IN_DELTA_PROVIDER:-}" "$DEF_DELTA_PROVIDER")"
+            MODEL_ID="$(pick "${IN_DELTA_MODEL:-}" "$DEF_DELTA_MODEL")"
+            EFFORT="$(pick "${IN_DELTA_EFFORT:-}" "$DEF_DELTA_EFFORT")"
+            MAX_TOKENS="$(pick "${IN_DELTA_MAX:-}" "$DEF_DELTA_MAX")"
+          fi
+
+          # Endpoints are hardcoded, selected by a closed enum. A base-URL input
+          # would let anyone who can edit a caller stub redirect a live API key
+          # to a host of their choosing, and the digest's own output would look
+          # completely normal while doing it. The provider picks the endpoint
+          # AND the secret together, so the two can never be mismatched.
+          case "$PROVIDER" in
+            openai)   API_BASE='https://api.openai.com/v1';   KEY_ENV='OPENAI_API_KEY' ;;
+            moonshot) API_BASE='https://api.moonshot.ai/v1'; KEY_ENV='MOONSHOT_API_KEY' ;;
+            *) echo "::error::${MODE}_provider must be 'openai' or 'moonshot', got '$PROVIDER'"; exit 1 ;;
+          esac
+
+          # WHERE THE ASSETS COME FROM.
+          #
+          # A called reusable workflow cannot discover its own origin. Measured
+          # in a real cross-repo call, not assumed: the job_workflow_ref and
+          # job_workflow_sha context values are both EMPTY, and workflow_ref is
+          # the CALLER's entry workflow. So "check out this repo at the ref I
+          # was invoked at" is not expressible, and an earlier version of this
+          # step silently fell back to checking out the CALLER into _central.
+          #
+          # Integrity comes from content instead of location: the fetched assets
+          # are hashed and compared against EXPECTED_ASSETS_SHA256, a literal in
+          # THIS file. The caller pins this file to a full commit SHA, so the
+          # pin fixes the expected hash, and the hash fixes the code. A moved
+          # tag or a force-pushed branch fails the job instead of running.
+          CENTRAL_REPO="$(pick "${IN_CENTRAL_REPO:-}" "$DEF_CENTRAL_REPO")"
+          CENTRAL_REF="${IN_CENTRAL_REF:-}"
+          if [ -z "$CENTRAL_REF" ]; then
+            echo "::error::central_ref is required. Set it to the SAME commit SHA as the uses: line in your caller stub, so the workflow and the script it runs come from one release."
+            exit 1
+          fi
+          if ! matches "$CENTRAL_REPO" '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+            echo "::error::refusing to check out '$CENTRAL_REPO': not a plain owner/repo"
+            exit 1
+          fi
+          # A full commit SHA and nothing else. Branch and tag names used to be
+          # accepted, which quietly permitted the mutable-ref case the asset
+          # hash is only a second line of defence against. Content at a SHA is
+          # immutable, and that is what makes the pin mean anything.
+          #
+          # This check ONLY works because `matches` rejects newlines first: grep
+          # is line oriented, so a value like "<40 hex>\ncentral_repo=evil/repo"
+          # matches '^[0-9a-f]{40}$' on its first line and would otherwise pass,
+          # then inject a second GITHUB_OUTPUT record that redirects the central
+          # checkout. The SHA rule and the newline rule only work together.
+          if ! matches "$CENTRAL_REF" '^[0-9a-f]{40}$'; then
+            echo "::error::central_ref must be a full 40 character commit SHA, got '$CENTRAL_REF'. Set it to the same SHA as the uses: line in your caller stub. Branch and tag names are rejected: they can move, and a pin to something that moves is not a pin."
+            exit 1
+          fi
+
+          put DIGEST_MODE "$MODE"
+          put DIGEST_MODEL_LABEL "$MODEL_LABEL"
+          put DIGEST_API_BASE "$API_BASE"
+          put DIGEST_KEY_ENV "$KEY_ENV"
+          put DIGEST_MODEL "$MODEL_ID"
+          put DIGEST_EFFORT "$EFFORT"
+          put DIGEST_MAX_COMPLETION_TOKENS "$MAX_TOKENS"
+          put DIGEST_ISSUE_TITLE "$(pick "${IN_ISSUE_TITLE:-}" "$DEF_ISSUE_TITLE")"
+          put DIGEST_ASSIGNEE "${IN_ASSIGNEE:-}"
+          put DIGEST_DOCS_PATHS "$(pick "${IN_DOCS_PATHS:-}" "$DEF_DOCS_PATHS")"
+          put DIGEST_BINARY_EXTENSIONS "$(pick "${IN_BINARY_EXTENSIONS:-}" "$DEF_BINARY_EXTENSIONS")"
+          put DIGEST_PROMPT_EXTRA "${IN_PROMPT_EXTRA:-}"
+          put DIGEST_PRICING "$(pick "${IN_PRICING:-}" "$DEF_PRICING")"
+          put DIGEST_WARN_INPUT_TOKENS "$(pick "${IN_WARN:-}" "$DEF_WARN")"
+          put DIGEST_CHUNK_INPUT_TOKENS "$(pick "${IN_CHUNK:-}" "$DEF_CHUNK")"
+          put DIGEST_CLIENT_TIMEOUT_MS "$(pick "${IN_TIMEOUT_MS:-}" "$DEF_TIMEOUT_MS")"
+          put DIGEST_BOOTSTRAP_WINDOW_DAYS "$(pick "${IN_BOOTSTRAP_DAYS:-}" "$DEF_BOOTSTRAP_DAYS")"
+          put DIGEST_FINDINGS_CAP "$(pick "${IN_FINDINGS_CAP:-}" "$DEF_FINDINGS_CAP")"
+          put DIGEST_WORD_CAP "$(pick "${IN_WORD_CAP:-}" "$DEF_WORD_CAP")"
+          put DIGEST_CENTRAL_REF "$CENTRAL_REF"
+
+          # Even a single chunk gets two attempts. If that alone cannot fit the
+          # job, every run is killed mid-call and nothing ever posts.
+          TIMEOUT_MS="$(pick "${IN_TIMEOUT_MS:-}" "$DEF_TIMEOUT_MS")"
+          JOB_MS=4200000 # keep in lockstep with timeout-minutes on the job
+          if [ $(( TIMEOUT_MS * 2 )) -gt "$JOB_MS" ]; then
+            echo "::error::client_timeout_ms ($TIMEOUT_MS) allows two attempts totalling $(( TIMEOUT_MS * 2 / 60000 )) minutes, but the job allows $(( JOB_MS / 60000 )) minutes. The job would be killed mid-call on every run. Lower client_timeout_ms, or raise timeout-minutes AND DIGEST_JOB_BUDGET_MS together in ai-digest.yml."
+            exit 1
+          fi
+
+          NODE_VERSION="$(pick "${IN_NODE_VERSION:-}" "$DEF_NODE_VERSION")"
+          if ! matches "$NODE_VERSION" '^[0-9]+(\.[0-9]+){0,2}$'; then
+            echo "::error::node_version must look like 24 or 24.1.0, got '$NODE_VERSION'"
+            exit 1
+          fi
+          # Same hazard as GITHUB_ENV above. Safe because every value here is
+          # validated with the NUL-delimited `matches` helper or is a closed
+          # enum, so none can carry a newline. An earlier version used plain
+          # `grep -Eq`, which is line oriented and would have let a multiline
+          # value through to inject extra step outputs. Anything added to this
+          # block must go through `matches` first.
+          {
+            printf 'central_repo=%s\n' "$CENTRAL_REPO"
+            printf 'central_ref=%s\n' "$CENTRAL_REF"
+            printf 'node_version=%s\n' "$NODE_VERSION"
+            printf 'key_env=%s\n' "$KEY_ENV"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "mode=$MODE model=$MODEL_ID effort=${EFFORT:-none} key=$KEY_ENV"
+          echo "central: $CENTRAL_REPO @ $CENTRAL_REF (verified by asset hash, not by ref)"
+          echo "node: $NODE_VERSION"
+
+      - name: Require the API key for this mode
+        env:
+          KEY_ENV: ${{ steps.cfg.outputs.key_env }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+        run: |
+          set -euo pipefail
+          # A case statement rather than indirect expansion: KEY_ENV is already
+          # a closed enum, and `eval` on anything derived from workflow inputs
+          # is not worth the two lines it saves.
+          case "$KEY_ENV" in
+            OPENAI_API_KEY)   value="${OPENAI_API_KEY:-}" ;;
+            MOONSHOT_API_KEY) value="${MOONSHOT_API_KEY:-}" ;;
+            *) echo "::error::internal: unexpected key env '$KEY_ENV'"; exit 1 ;;
+          esac
+          if [ -z "$value" ]; then
+            echo "::error::${DIGEST_MODE:-this} mode needs the $KEY_ENV secret. Add it to the CALLING repository (Settings, Secrets and variables, Actions) AND map it explicitly in the caller stub's \`secrets:\` block. This workflow deliberately does not use secrets: inherit, so a secret that exists but is not mapped looks exactly like a missing one."
+            exit 1
+          fi
+
+      - name: Check out the calling repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Full history: the delta base is an arbitrary past SHA, and a shallow
+          # clone would make it resolve to nothing, which reads as a permanently
+          # quiet period rather than as an error.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check that _central is free
+        # The second checkout lands at github.workspace/_central. If the caller
+        # happens to track anything there, that checkout would overwrite the
+        # caller's own files and full mode could then read central assets in
+        # their place. Cheap to check, confusing to debug otherwise.
+        run: |
+          set -euo pipefail
+          if [ -n "$(git -C "$GITHUB_WORKSPACE" ls-files -- _central)" ]; then
+            echo "::error::this repository tracks files under _central/, which the digest reserves for the central checkout. Rename that path, or the digest cannot run here."
+            exit 1
+          fi
+
+      - name: Check that the central repo is reachable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CENTRAL_REPO: ${{ steps.cfg.outputs.central_repo }}
+          HAVE_TOKEN: ${{ secrets.CENTRAL_REPO_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$HAVE_TOKEN" = "true" ]; then
+            echo "CENTRAL_REPO_TOKEN supplied; skipping the public-readability probe."
+            exit 0
+          fi
+          if gh api "repos/$CENTRAL_REPO" --silent 2>/dev/null; then
+            echo "$CENTRAL_REPO is readable with the caller's GITHUB_TOKEN."
+            exit 0
+          fi
+          echo "::error::Cannot read $CENTRAL_REPO with this repository's GITHUB_TOKEN. That token is scoped to ${GITHUB_REPOSITORY}, so it cannot clone a DIFFERENT private repository. Two fixes, pick one: (a) make $CENTRAL_REPO public, which is the intended end state and costs nothing since it holds no secrets; or (b) create a read-only fine-grained PAT with Contents: Read on $CENTRAL_REPO, add it to this repository as a secret, and map it in the caller stub as CENTRAL_REPO_TOKEN. Note that being able to CALL a private reusable workflow (the Actions access setting) is a separate permission from being able to CLONE that repo, and only the clone needs this."
+          exit 1
+
+      - name: Check out the central assets at the same ref
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.cfg.outputs.central_repo }}
+          ref: ${{ steps.cfg.outputs.central_ref }}
+          path: _central
+          token: ${{ secrets.CENTRAL_REPO_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ steps.cfg.outputs.node_version }}
+          # No npm ci: the script is dependency-free (node stdlib plus native
+          # fetch), so there is nothing to install or cache.
+
+      - name: Verify the central assets
+        env:
+          # THE integrity control. Regenerate with `node scripts/assets-hash.mjs`
+          # whenever anything under scripts/ or prompts/ changes, in the same
+          # commit; CI fails otherwise. Because the caller pins this workflow
+          # file to a full commit SHA, pinning the workflow pins this value, and
+          # this value pins the code that runs with the caller's API keys. That
+          # is a stronger guarantee than trusting a ref name, which is what the
+          # original design assumed it could do.
+          CENTRAL_REPO: ${{ steps.cfg.outputs.central_repo }}
+          CENTRAL_REF: ${{ steps.cfg.outputs.central_ref }}
+          EXPECTED_ASSETS_SHA256: '31c876f753748820d66ff2b5184d06d61308ee2172b95b342d36f9db519caca4'
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in _central/scripts/ai-weekly-digest.mjs _central/scripts/digest-prompt.mjs \
+                   _central/scripts/digest-state.mjs _central/scripts/assets-hash.mjs \
+                   _central/scripts/digest-sanitize.mjs \
+                   _central/prompts/digest-prompt.txt; do
+            [ -f "$f" ] || { echo "::error::expected $f in the central checkout"; missing=1; }
+          done
+          if [ "$missing" = 1 ]; then
+            echo "::error::_central does not look like the digest repo. Check the central_repo and central_ref inputs."
+            exit 1
+          fi
+          # Computed with an INLINE implementation, deliberately not by running
+          # _central/scripts/assets-hash.mjs. Running the verifier out of the
+          # tree it is meant to verify means a tampered checkout can ship a
+          # verifier that simply prints the expected value, and it executes
+          # before anything has been checked. The file list is duplicated here
+          # on purpose; CI asserts it matches ASSET_FILES exactly.
+          ACTUAL="$(node -e '
+            const c = require("node:crypto"), fs = require("node:fs");
+            const files = [
+              "prompts/digest-prompt.sha256",
+              "prompts/digest-prompt.txt",
+              "scripts/ai-weekly-digest.mjs",
+              "scripts/assets-hash.mjs",
+              "scripts/digest-prompt.mjs",
+              "scripts/digest-sanitize.mjs",
+              "scripts/digest-state.mjs",
+              "scripts/prompt-hash.mjs",
+            ];
+            const h = c.createHash("sha256");
+            for (const r of files.sort()) {
+              const b = fs.readFileSync("_central/" + r);
+              h.update(r, "utf8").update("\0").update(String(b.length)).update("\0").update(b).update("\0");
+            }
+            process.stdout.write(h.digest("hex"));
+          ')"
+          if [ "$ACTUAL" != "$EXPECTED_ASSETS_SHA256" ]; then
+            echo "::error::central asset hash mismatch. Expected $EXPECTED_ASSETS_SHA256, fetched $ACTUAL."
+            echo "::error::The assets at ${CENTRAL_REPO}@${CENTRAL_REF} are not the ones this pinned workflow was released with. Refusing to run them. central_ref and the uses: SHA must name the SAME commit; if you meant to upgrade, bump both together."
+            exit 1
+          fi
+          echo "central assets verified by content: $ACTUAL"
+          # The prompt is versioned separately, and its own hash guards it.
+          node _central/scripts/prompt-hash.mjs --check
+
+      - name: Build and post the digest
+        env:
+          # Explicit on the step, never assumed from the ambient environment:
+          # with two checkouts in play, an implicit repo would be a coin flip.
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # ONLY the selected key, under a neutral name. Handing both secrets to
+          # the step that makes an outbound HTTPS call widens the blast radius
+          # of any future bug in that step for no benefit: one mode uses one key.
+          # The guard step above has already failed the job if this is empty, so
+          # the `||` fallthrough is unreachable rather than silently wrong.
+          DIGEST_API_KEY: ${{ steps.cfg.outputs.key_env == 'OPENAI_API_KEY' && secrets.OPENAI_API_KEY || secrets.MOONSHOT_API_KEY }}
+          # Must match timeout-minutes on the job above.
+          DIGEST_JOB_BUDGET_MS: '4200000'
+          DIGEST_CALLER_DIR: ${{ github.workspace }}
+          DIGEST_PROMPT_FILE: ${{ github.workspace }}/_central/prompts/digest-prompt.txt
+          # Pin the repository default branch explicitly: GITHUB_REF_NAME
+          # follows whatever ref a manual dispatch selects, so without this a
+          # dispatch from an unmerged branch would record that branch's SHA as
+          # the rolling cursor.
+          DIGEST_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # On cron the inputs context is empty, and GitHub's loose equality
+          # makes `null != false` FALSE, so the naive expression would make
+          # every scheduled run a dry run. Schedule always posts.
+          DIGEST_POST: ${{ (github.event_name == 'schedule' || inputs.post) && 'true' || 'false' }}
+          DIGEST_INCLUDE_DOCS: ${{ inputs.include_docs == true && 'true' || 'false' }}
+        # Run from the central checkout so the script's own relative imports
+        # resolve; the caller tree is reached only through DIGEST_CALLER_DIR.
+        working-directory: _central
+        run: node scripts/ai-weekly-digest.mjs

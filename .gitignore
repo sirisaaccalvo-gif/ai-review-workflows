@@ -1,0 +1,6 @@
+# Nothing is built or installed here. This exists to keep a local smoke-test
+# checkout of a caller repo, and the scratch file the digest writes when it is
+# run by hand, out of commits.
+_central/
+node_modules/
+ai-digest-comment.md

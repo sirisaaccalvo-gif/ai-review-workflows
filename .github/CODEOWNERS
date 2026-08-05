@@ -1,0 +1,15 @@
+# Path ownership for the three things a caller's API keys and issues:write
+# token actually depend on: the workflow, the prompt, and the digest script.
+#
+# Currently ADVISORY. "Require review from Code Owners" is deliberately OFF in
+# branch protection: this repo has one collaborator, GitHub does not let anyone
+# approve their own pull request, and `enforce_admins` is on, so turning the
+# requirement on would make every PR here permanently unmergeable. The
+# enforceable half of the rule is already live: main takes no direct pushes, CI
+# must pass, and conversations must resolve.
+#
+# Turn `require_code_owner_reviews` on the moment a second reviewer exists.
+
+/.github/workflows/  @sirisaaccalvo-gif
+/prompts/            @sirisaaccalvo-gif
+/scripts/            @sirisaaccalvo-gif

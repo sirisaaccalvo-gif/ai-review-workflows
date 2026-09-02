@@ -385,10 +385,36 @@ if (MODE === 'delta') {
   }
   const log = (await git('log', '--oneline', '--no-decorate', `${base}..${head}`)).trim()
   const commitCount = log ? log.split('\n').length : 0
-  const diff = await git('diff', `${base}..${head}`, '--', '.',
+  const rawDiff = await git('diff', `${base}..${head}`, '--', '.',
     ':(exclude)*package-lock.json', ':(exclude)*.lock', ':(exclude)*pnpm-lock.yaml', ':(exclude)*bun.lockb', ':(exclude)*go.sum')
+  // Git prints a TEXT diff for any file its NUL-byte heuristic does not flag as
+  // binary, and a PDF built from HTML passes that heuristic. One such PDF put
+  // 2.4 million characters of stream data into a delta diff; the chars/4
+  // estimate undercounted it by about 2x, so the chunker packed it under the
+  // ceiling and the provider rejected the call at 1.6M tokens. A failed run
+  // never moves the cursor, so the same range failed again the next month.
+  // Full mode already skips these extensions when it walks the tree; delta
+  // applies the same list to the diff's file sections, by the header's b/
+  // path, and discloses every drop. A repo can also mark the type binary in
+  // its own .gitattributes, which turns the section into one line at the
+  // source; this guard is for repos that have not.
+  const kept = []
+  const excluded = []
+  for (const section of rawDiff.split(/(?=^diff --git )/m)) {
+    const header = section.split('\n', 1)[0]
+    if (header.startsWith('diff --git ') && BINARY.test(header)) {
+      excluded.push(header.slice(header.lastIndexOf(' b/') + 3))
+      continue
+    }
+    kept.push(section)
+  }
+  const diff = kept.join('')
+  if (excluded.length) {
+    const shown = excluded.slice(0, 5).map((f) => `\`${f}\``).join(', ')
+    notes.push(`ℹ️ excluded ${excluded.length} changed file(s) with a binary extension from the diff: ${shown}${excluded.length > 5 ? `, and ${excluded.length - 5} more` : ''}`)
+  }
   rangeLabel = `\`${short(base)}..${short(head)}\`, ${commitCount} commits`
-  inputText = `## Commits in range\n${log}\n\n## Combined diff (lockfiles excluded)\n${diff}`
+  inputText = `## Commits in range\n${log}\n\n## Combined diff (lockfiles and binary extensions excluded)\n${diff}`
 } else {
   // full: the tracked code corpus at HEAD. Code-only by default; the docs paths
   // are opt-in because they are prose and can dwarf the code.

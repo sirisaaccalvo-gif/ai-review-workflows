@@ -121,7 +121,7 @@ on:
         type: string
         required: false
       binary_extensions:
-        description: "Regex alternation of file extensions excluded from full-mode scans. Default excludes images, fonts, archives, audio and video."
+        description: "Regex alternation of file extensions excluded from full-mode scans and from delta diffs. Default excludes images, fonts, archives, audio and video."
         type: string
         required: false
       prompt_extra:
@@ -543,7 +543,7 @@ jobs:
           # original design assumed it could do.
           CENTRAL_REPO: ${{ steps.cfg.outputs.central_repo }}
           CENTRAL_REF: ${{ steps.cfg.outputs.central_ref }}
-          EXPECTED_ASSETS_SHA256: '31c876f753748820d66ff2b5184d06d61308ee2172b95b342d36f9db519caca4'
+          EXPECTED_ASSETS_SHA256: '74b4028b0f459006e4dbe63ec441ce02aeb10ff174680eaeb27f70a2d702f5ab'
         run: |
           set -euo pipefail
           missing=0

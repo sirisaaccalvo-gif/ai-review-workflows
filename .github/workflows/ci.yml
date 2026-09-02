@@ -384,6 +384,10 @@ jobs:
           old="$(python3 -c "import datetime;print((datetime.datetime.now()-datetime.timedelta(days=90)).strftime('%Y-%m-%dT%H:%M:%S'))")"
           GIT_AUTHOR_DATE="$old" GIT_COMMITTER_DATE="$old" git commit -qm "base commit"
           printf 'export const a = 2\nexport const b = 3\n' > a.mjs
+          # A PDF that git diffs as TEXT (no NUL bytes, so the binary heuristic
+          # passes it). Delta must drop the section: a real one put 2.4M chars
+          # of stream data into a diff and the provider rejected the call.
+          printf '%%PDF-1.4\nPDFSTREAMMARKER\n' > packet.pdf
           git add -A && git commit -qm "a change to review"
           git update-ref refs/remotes/origin/main HEAD
           cd "$GITHUB_WORKSPACE"
@@ -428,6 +432,18 @@ jobs:
           fi
           grep -q 'escaped.txt' "$RUNNER_TEMP/prompt.txt" && { echo "::error::symlink path appears in the prompt"; exit 1; }
           echo "symlink content confirmed absent from the composed prompt"
+
+          # Delta must not send a text-diffed binary to the model, and must say
+          # that it dropped one.
+          DIGEST_DEBUG_DUMP_PROMPT="$RUNNER_TEMP/delta-prompt.txt" DIGEST_MODE=delta \
+            node scripts/ai-weekly-digest.mjs > /dev/null
+          if grep -q 'PDFSTREAMMARKER' "$RUNNER_TEMP/delta-prompt.txt"; then
+            echo "::error::delta sent the contents of a .pdf to the model; binary extensions must be dropped from the diff"
+            exit 1
+          fi
+          grep -q 'excluded 1 changed file(s) with a binary extension' "$RUNNER_TEMP/delta.out" || { echo "::error::delta dropped the .pdf section without disclosing it"; exit 1; }
+          grep -q 'PDFSTREAMMARKER' "$RUNNER_TEMP/prompt.txt" && { echo "::error::full mode read a .pdf into the corpus"; exit 1; }
+          echo "text-diffed .pdf confirmed absent from both prompts and disclosed in the delta header"
 
           # An oversized model response must still produce a postable body.
           # Unbounded, a 422 from GitHub leaves the cursor unmoved and every

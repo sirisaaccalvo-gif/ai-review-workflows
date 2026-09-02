@@ -131,7 +131,7 @@ configuration` step of [`ai-digest.yml`](.github/workflows/ai-digest.yml).
 | `issue_title` | `🤖 AI weekly code digest (automated)` | **see the warning below** |
 | `assignee` | repository owner | best effort; a failed assignment warns, never fails the digest |
 | `docs_paths` | `docs/,.planning/` | prose prefixes gated behind `include_docs` |
-| `binary_extensions` | images, fonts, archives, audio, video | regex alternation |
+| `binary_extensions` | images, fonts, archives, audio, video | regex alternation; skipped by full mode and dropped from delta diffs |
 | `prompt_extra` | *(empty)* | one or two sentences of repo-specific risk weighting |
 | `pricing` | Terra + K3 | JSON keyed by model id, for the cost footer |
 | `warn_input_tokens` | `250000` | |

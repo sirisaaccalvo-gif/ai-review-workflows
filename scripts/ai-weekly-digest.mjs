@@ -124,6 +124,12 @@ for (const k of ['label', 'base', 'keyEnv', 'model']) {
   if (!MODEL[k]) fail(`missing model configuration: DIGEST_${({ label: 'MODEL_LABEL', base: 'API_BASE', keyEnv: 'KEY_ENV', model: 'MODEL' })[k]} is required`)
 }
 if (!/^https:\/\//.test(MODEL.base)) fail(`DIGEST_API_BASE must be an https URL, got ${JSON.stringify(MODEL.base)}`)
+// Which endpoint under that base: Chat Completions (the default, and the only
+// path before this input existed) or the OpenAI Responses API. Some settings
+// exist only on responses: gpt-6-luna rejects reasoning_effort "max" on chat
+// with a 400 but accepts reasoning.effort "max" there (measured 2026-10-13).
+const API = str('DIGEST_API', 'chat')
+if (!['chat', 'responses'].includes(API)) fail(`DIGEST_API must be 'chat' or 'responses', got ${JSON.stringify(API)}`)
 
 const MAX_COMPLETION_TOKENS = int('DIGEST_MAX_COMPLETION_TOKENS', MODE === 'full' ? 131072 : 32768)
 // Mutable: when chunking splits the work, the per-attempt budget is rescaled
@@ -588,28 +594,45 @@ async function callModel(user, attempt = 1) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), CLIENT_TIMEOUT_MS)
   try {
-    const res = await fetch(`${MODEL.base}/chat/completions`, {
+    const body = API === 'responses'
+      ? {
+          // The Responses API equivalent of the chat body below: instructions
+          // is the system message, reasoning.effort replaces reasoning_effort,
+          // and max_output_tokens bounds reasoning plus visible output just as
+          // max_completion_tokens does. store: false keeps the reviewed diff out
+          // of OpenAI's stored-response history. Usage arrives on the terminal
+          // event without an opt-in, so there is no stream_options here.
+          model: MODEL.model,
+          instructions: SYSTEM,
+          input: user,
+          store: false,
+          max_output_tokens: MAX_COMPLETION_TOKENS,
+          ...(MODEL.effort ? { reasoning: { effort: MODEL.effort } } : {}),
+          stream: true,
+        }
+      : {
+          model: MODEL.model,
+          max_completion_tokens: MAX_COMPLETION_TOKENS,
+          ...(MODEL.effort ? { reasoning_effort: MODEL.effort } : {}),
+          // Streaming is a transport decision, not a product one. A full-mode
+          // max-effort call reasons silently for 5+ minutes before its first
+          // token, and the non-streaming version of this request died at ~300s
+          // with undici's "fetch failed", twice, identically, waiting for
+          // response headers that only arrive after reasoning completes (undici's
+          // default headersTimeout is 300s, so the client itself was the killer).
+          // With stream: true the 200 and first SSE bytes arrive within seconds
+          // and the socket stays warm through the thinking phase. include_usage
+          // is what makes the cost footer and the usage log line possible: the
+          // stream's final chunk carries the token counts.
+          stream: true,
+          stream_options: { include_usage: true },
+          messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: user }],
+        }
+    const res = await fetch(`${MODEL.base}/${API === 'responses' ? 'responses' : 'chat/completions'}`, {
       method: 'POST',
       signal: controller.signal,
       headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-      body: JSON.stringify({
-        model: MODEL.model,
-        max_completion_tokens: MAX_COMPLETION_TOKENS,
-        ...(MODEL.effort ? { reasoning_effort: MODEL.effort } : {}),
-        // Streaming is a transport decision, not a product one. A full-mode
-        // max-effort call reasons silently for 5+ minutes before its first
-        // token, and the non-streaming version of this request died at ~300s
-        // with undici's "fetch failed", twice, identically, waiting for
-        // response headers that only arrive after reasoning completes (undici's
-        // default headersTimeout is 300s, so the client itself was the killer).
-        // With stream: true the 200 and first SSE bytes arrive within seconds
-        // and the socket stays warm through the thinking phase. include_usage
-        // is what makes the cost footer and the usage log line possible: the
-        // stream's final chunk carries the token counts.
-        stream: true,
-        stream_options: { include_usage: true },
-        messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: user }],
-      }),
+      body: JSON.stringify(body),
     })
     if ((res.status === 429 || res.status >= 500) && attempt === 1) {
       console.log(`::warning::model API returned ${res.status}; retrying once in 30s`)
@@ -617,18 +640,79 @@ async function callModel(user, attempt = 1) {
       return callModel(user, 2)
     }
     if (!res.ok) fail(`model API error ${res.status}: ${(await res.text()).slice(0, 300)}`)
-    // Minimal SSE accumulator, dependency-free like the rest of this script:
-    // "data: {json}" lines terminated by "data: [DONE]". Visible text arrives in
-    // choices[0].delta.content (reasoning deltas keep the connection warm but
-    // are not part of the digest); finish_reason rides the last content chunk;
-    // usage rides a final chunk with empty choices. A partial line at a read
-    // boundary is carried over, and a malformed data line throws so the outer
-    // catch gets the same one-retry the old whole-body JSON parse path had.
+    // Minimal SSE accumulator, dependency-free like the rest of this script.
+    // Chat: "data: {json}" lines terminated by "data: [DONE]". Visible text
+    // arrives in choices[0].delta.content (reasoning deltas keep the connection
+    // warm but are not part of the digest); finish_reason rides the last content
+    // chunk; usage rides a final chunk with empty choices. Responses: typed
+    // events, see consumeResponses. A partial line at a read boundary is
+    // carried over, and a malformed data line throws so the outer catch gets
+    // the same one-retry the old whole-body JSON parse path had.
     let content = ''
     let finish = null
     let usage = null
+    let streamError = null
+    // Set by the first Responses terminal event. The outcome is decided there:
+    // a later event cannot overwrite it (a stray completed after an error would
+    // otherwise turn a failure into a post), and the read loop stops, so a
+    // transport hiccup after the answer is complete cannot trigger a second,
+    // billed attempt. Chat keeps its original read-to-the-end behavior because
+    // its usage chunk arrives after finish_reason.
+    let terminal = false
     let buf = ''
     const decoder = new TextDecoder()
+    // Responses reports input_tokens/output_tokens; the footer, the cost
+    // estimate and the totals all read chat's prompt_tokens/completion_tokens,
+    // so map once here rather than teaching every reader two shapes.
+    // Partial counts would price as NaN or as a wrong number, so anything short
+    // of both totals counts as no usage, which the footer discloses.
+    const responsesUsage = (u) => (Number.isFinite(u?.input_tokens) && Number.isFinite(u?.output_tokens)
+      ? {
+          prompt_tokens: u.input_tokens,
+          completion_tokens: u.output_tokens,
+          reasoning_tokens: u.output_tokens_details?.reasoning_tokens ?? null,
+        }
+      : null)
+    // Responses events are typed. Visible text is response.output_text.delta.
+    // The terminal event is response.completed (clean), response.incomplete
+    // (cut short: max_output_tokens maps onto the same disclosed-truncation
+    // path as chat's finish_reason=length, any other reason fails closed), or
+    // response.failed / error. Everything else (keepalive, reasoning items,
+    // output_item and content_part bookkeeping, output_text.done, which repeats
+    // the deltas) is ignored.
+    const consumeResponses = (chunk) => {
+      if (terminal) return
+      switch (chunk.type) {
+        case 'response.output_text.delta':
+          if (typeof chunk.delta === 'string') content += chunk.delta
+          break
+        case 'response.completed':
+          terminal = true
+          finish = 'stop'
+          usage = responsesUsage(chunk.response?.usage)
+          break
+        case 'response.incomplete': {
+          terminal = true
+          const why = chunk.response?.incomplete_details?.reason ?? 'unknown'
+          finish = why === 'max_output_tokens' ? 'length' : `incomplete:${why}`
+          usage = responsesUsage(chunk.response?.usage)
+          break
+        }
+        case 'response.failed':
+          terminal = true
+          finish = 'failed'
+          streamError = chunk.response?.error ?? { message: 'response.failed with no error detail' }
+          usage = responsesUsage(chunk.response?.usage)
+          break
+        case 'error':
+          // Documented flat ({type, code, message}); some deployments nest the
+          // same fields under error, as response.failed does.
+          terminal = true
+          finish = 'error'
+          streamError = chunk.error ?? { code: chunk.code ?? null, message: chunk.message ?? null }
+          break
+      }
+    }
     const consume = (line) => {
       // 'data:' with the space optional: the SSE spec allows both, and a
       // compliant proxy emitting 'data:{...}' would otherwise have every chunk
@@ -639,29 +723,54 @@ async function callModel(user, attempt = 1) {
       if (payload === '[DONE]') return
       let chunk
       try { chunk = JSON.parse(payload) } catch { throw new Error(`unparseable stream chunk: ${payload.slice(0, 200)}`) }
+      if (API === 'responses') return consumeResponses(chunk)
       const choice = chunk.choices?.[0]
       if (choice?.delta?.content) content += choice.delta.content
       if (choice?.finish_reason) finish = choice.finish_reason
       if (chunk.usage) usage = chunk.usage
     }
-    for await (const bytes of res.body) {
-      buf += decoder.decode(bytes, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop()
-      for (const line of lines) consume(line)
+    try {
+      for await (const bytes of res.body) {
+        buf += decoder.decode(bytes, { stream: true })
+        const lines = buf.split('\n')
+        buf = lines.pop()
+        for (const line of lines) {
+          consume(line)
+          if (terminal) break
+        }
+        if (terminal) break
+      }
+    } catch (err) {
+      // Once a terminal event is in hand the outcome is decided; an error
+      // from cancelling or tearing down the rest of the body must not send a
+      // finished answer to the retry path.
+      if (!terminal) throw err
     }
     // Flush: a stream that ends without a trailing newline leaves its last line
-    // in buf (and possibly bytes in the decoder). Both endpoints do terminate
-    // with a newline after [DONE], but a proxy that does not would otherwise
-    // silently cost the run its finish_reason and usage chunk and turn a clean
-    // completion into a spurious fail-closed. consume() is reused so the flush
-    // path shares the loop's parse-error handling.
-    buf += decoder.decode()
-    if (buf) consume(buf)
+    // in buf (and possibly bytes in the decoder). Both endpoints end their last
+    // event with a newline (chat's is the [DONE] line; Responses sends no
+    // [DONE] and ends on its terminal event), but a proxy that strips it would
+    // otherwise silently cost the run its terminal event and usage and turn a
+    // clean completion into a spurious fail-closed. consume() is reused so the
+    // flush path shares the loop's parse-error handling.
+    if (!terminal) {
+      buf += decoder.decode()
+      if (buf) consume(buf)
+    }
     // Token accounting also goes to the log, not only the footer: it is the
     // evidence that the effort setting is honored (reasoning tokens move with
     // it), and the log survives a run that fails before it can post.
     console.log(`model usage: ${JSON.stringify(usage ?? {})}`)
+    // Both before the hollow-digest check, because each has a better diagnosis
+    // than "empty review". A failed or errored response fails here even when
+    // it streamed some text first: partial output from a failed run is not a
+    // review of the range.
+    if (streamError) fail(`model stream reported ${finish}: ${JSON.stringify(streamError).slice(0, 300)}; not posting (cursor unchanged)`)
+    // At max effort reasoning can spend the whole ceiling before any visible
+    // text, which reads as an empty review but is fixed by a bigger ceiling.
+    if (finish === 'length' && !content.trim()) {
+      fail(`model hit the ${MAX_COMPLETION_TOKENS}-token output ceiling before writing any review text (reasoning counts against it); raise ${MODE}_max_completion_tokens. Not posting (cursor unchanged)`)
+    }
     if (!content.trim()) fail('model returned an empty review; refusing to post a hollow digest (and refusing to advance the cursor)')
     // Fail closed on any termination that is not clean completion or the
     // disclosed-truncation case: a content_filter or unknown finish would

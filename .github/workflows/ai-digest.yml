@@ -86,6 +86,10 @@ on:
         description: "Output ceiling for delta. Default 32768."
         type: string
         required: false
+      delta_api:
+        description: "chat (Chat Completions) or responses (the Responses API, openai provider only). Default chat. Some reasoning settings exist only on responses: gpt-6-luna accepts reasoning effort max there but not on chat."
+        type: string
+        required: false
 
       full_model_label:
         description: "Human label for the full-mode model. Default 'Kimi K3 (max reasoning)'."
@@ -105,6 +109,10 @@ on:
         required: false
       full_max_completion_tokens:
         description: "Output ceiling for full mode. Default 131072."
+        type: string
+        required: false
+      full_api:
+        description: "chat or responses, as delta_api but for full mode. Default chat."
         type: string
         required: false
 
@@ -233,11 +241,13 @@ jobs:
           IN_DELTA_MODEL: ${{ inputs.delta_model }}
           IN_DELTA_EFFORT: ${{ inputs.delta_effort }}
           IN_DELTA_MAX: ${{ inputs.delta_max_completion_tokens }}
+          IN_DELTA_API: ${{ inputs.delta_api }}
           IN_FULL_MODEL_LABEL: ${{ inputs.full_model_label }}
           IN_FULL_PROVIDER: ${{ inputs.full_provider }}
           IN_FULL_MODEL: ${{ inputs.full_model }}
           IN_FULL_EFFORT: ${{ inputs.full_effort }}
           IN_FULL_MAX: ${{ inputs.full_max_completion_tokens }}
+          IN_FULL_API: ${{ inputs.full_api }}
           IN_ISSUE_TITLE: ${{ inputs.issue_title }}
           IN_ASSIGNEE: ${{ inputs.assignee }}
           IN_DOCS_PATHS: ${{ inputs.docs_paths }}
@@ -264,10 +274,12 @@ jobs:
           DEF_DELTA_MODEL='gpt-5.6-terra'
           DEF_DELTA_EFFORT='high'
           DEF_DELTA_MAX='32768'
+          DEF_DELTA_API='chat'
           DEF_FULL_MODEL_LABEL='Kimi K3 (max reasoning)'
           DEF_FULL_PROVIDER='moonshot'
           DEF_FULL_MODEL='kimi-k3'
           DEF_FULL_MAX='131072'
+          DEF_FULL_API='chat'
           DEF_ISSUE_TITLE='🤖 AI weekly code digest (automated)'
           DEF_DOCS_PATHS='docs/,.planning/'
           DEF_BINARY_EXTENSIONS='png|jpe?g|webp|avif|gif|ico|woff2?|ttf|otf|pdf|zip|m4a|mp3|wav|aac|ogg|flac|mp4|m4v|mov|webm|avi'
@@ -347,12 +359,14 @@ jobs:
             # full-mode model's API default already is maximum effort.
             EFFORT="${IN_FULL_EFFORT:-}"
             MAX_TOKENS="$(pick "${IN_FULL_MAX:-}" "$DEF_FULL_MAX")"
+            API="$(pick "${IN_FULL_API:-}" "$DEF_FULL_API")"
           else
             MODEL_LABEL="$(pick "${IN_DELTA_MODEL_LABEL:-}" "$DEF_DELTA_MODEL_LABEL")"
             PROVIDER="$(pick "${IN_DELTA_PROVIDER:-}" "$DEF_DELTA_PROVIDER")"
             MODEL_ID="$(pick "${IN_DELTA_MODEL:-}" "$DEF_DELTA_MODEL")"
             EFFORT="$(pick "${IN_DELTA_EFFORT:-}" "$DEF_DELTA_EFFORT")"
             MAX_TOKENS="$(pick "${IN_DELTA_MAX:-}" "$DEF_DELTA_MAX")"
+            API="$(pick "${IN_DELTA_API:-}" "$DEF_DELTA_API")"
           fi
 
           # Endpoints are hardcoded, selected by a closed enum. A base-URL input
@@ -365,6 +379,19 @@ jobs:
             moonshot) API_BASE='https://api.moonshot.ai/v1'; KEY_ENV='MOONSHOT_API_KEY' ;;
             *) echo "::error::${MODE}_provider must be 'openai' or 'moonshot', got '$PROVIDER'"; exit 1 ;;
           esac
+
+          # Which endpoint path the script calls under that base, also a closed
+          # enum. responses is the OpenAI Responses API; Moonshot does not serve
+          # it, so the pairing is refused here rather than failing on a 404
+          # after the job has done all its other work.
+          case "$API" in
+            chat|responses) ;;
+            *) echo "::error::${MODE}_api must be 'chat' or 'responses', got '$API'"; exit 1 ;;
+          esac
+          if [ "$API" = responses ] && [ "$PROVIDER" != openai ]; then
+            echo "::error::${MODE}_api 'responses' needs ${MODE}_provider 'openai', got '$PROVIDER'"
+            exit 1
+          fi
 
           # WHERE THE ASSETS COME FROM.
           #
@@ -412,6 +439,7 @@ jobs:
           put DIGEST_MODEL "$MODEL_ID"
           put DIGEST_EFFORT "$EFFORT"
           put DIGEST_MAX_COMPLETION_TOKENS "$MAX_TOKENS"
+          put DIGEST_API "$API"
           put DIGEST_ISSUE_TITLE "$(pick "${IN_ISSUE_TITLE:-}" "$DEF_ISSUE_TITLE")"
           put DIGEST_ASSIGNEE "${IN_ASSIGNEE:-}"
           put DIGEST_DOCS_PATHS "$(pick "${IN_DOCS_PATHS:-}" "$DEF_DOCS_PATHS")"
@@ -453,7 +481,7 @@ jobs:
             printf 'key_env=%s\n' "$KEY_ENV"
           } >> "$GITHUB_OUTPUT"
 
-          echo "mode=$MODE model=$MODEL_ID effort=${EFFORT:-none} key=$KEY_ENV"
+          echo "mode=$MODE model=$MODEL_ID effort=${EFFORT:-none} api=$API key=$KEY_ENV"
           echo "central: $CENTRAL_REPO @ $CENTRAL_REF (verified by asset hash, not by ref)"
           echo "node: $NODE_VERSION"
 
@@ -543,7 +571,7 @@ jobs:
           # original design assumed it could do.
           CENTRAL_REPO: ${{ steps.cfg.outputs.central_repo }}
           CENTRAL_REF: ${{ steps.cfg.outputs.central_ref }}
-          EXPECTED_ASSETS_SHA256: '74b4028b0f459006e4dbe63ec441ce02aeb10ff174680eaeb27f70a2d702f5ab'
+          EXPECTED_ASSETS_SHA256: '2336626a31c63956887e2b5588169990e40aa2d498ee05d0fdd941e849bacf74'
         run: |
           set -euo pipefail
           missing=0

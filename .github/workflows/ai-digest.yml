@@ -132,6 +132,10 @@ on:
         description: "Regex alternation of file extensions excluded from full-mode scans and from delta diffs. Default excludes images, fonts, archives, audio and video."
         type: string
         required: false
+      exclude_paths:
+        description: "Comma separated git glob patterns (e.g. 'research/**,docs/previews/**/*.html') whose contents are never sent to the model, in delta or full mode. The review lists the skipped files by name. Default empty."
+        type: string
+        required: false
       prompt_extra:
         description: "One or two sentences appended to the review instructions, for repo-specific risk weighting. Not a prompt replacement."
         type: string
@@ -252,6 +256,7 @@ jobs:
           IN_ASSIGNEE: ${{ inputs.assignee }}
           IN_DOCS_PATHS: ${{ inputs.docs_paths }}
           IN_BINARY_EXTENSIONS: ${{ inputs.binary_extensions }}
+          IN_EXCLUDE_PATHS: ${{ inputs.exclude_paths }}
           IN_PROMPT_EXTRA: ${{ inputs.prompt_extra }}
           IN_PRICING: ${{ inputs.pricing }}
           IN_WARN: ${{ inputs.warn_input_tokens }}
@@ -444,6 +449,7 @@ jobs:
           put DIGEST_ASSIGNEE "${IN_ASSIGNEE:-}"
           put DIGEST_DOCS_PATHS "$(pick "${IN_DOCS_PATHS:-}" "$DEF_DOCS_PATHS")"
           put DIGEST_BINARY_EXTENSIONS "$(pick "${IN_BINARY_EXTENSIONS:-}" "$DEF_BINARY_EXTENSIONS")"
+          put DIGEST_EXCLUDE_PATHS "${IN_EXCLUDE_PATHS:-}"
           put DIGEST_PROMPT_EXTRA "${IN_PROMPT_EXTRA:-}"
           put DIGEST_PRICING "$(pick "${IN_PRICING:-}" "$DEF_PRICING")"
           put DIGEST_WARN_INPUT_TOKENS "$(pick "${IN_WARN:-}" "$DEF_WARN")"
@@ -571,7 +577,7 @@ jobs:
           # original design assumed it could do.
           CENTRAL_REPO: ${{ steps.cfg.outputs.central_repo }}
           CENTRAL_REF: ${{ steps.cfg.outputs.central_ref }}
-          EXPECTED_ASSETS_SHA256: '2336626a31c63956887e2b5588169990e40aa2d498ee05d0fdd941e849bacf74'
+          EXPECTED_ASSETS_SHA256: '0eb27ed17f65792fb75eee5d2e5b97e6b824c35683fdc1d657de326a7ef7748b'
         run: |
           set -euo pipefail
           missing=0

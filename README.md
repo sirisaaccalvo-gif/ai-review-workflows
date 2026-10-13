@@ -134,6 +134,7 @@ configuration` step of [`ai-digest.yml`](.github/workflows/ai-digest.yml).
 | `assignee` | repository owner | best effort; a failed assignment warns, never fails the digest |
 | `docs_paths` | `docs/,.planning/` | prose prefixes gated behind `include_docs` |
 | `binary_extensions` | images, fonts, archives, audio, video | regex alternation; skipped by full mode and dropped from delta diffs |
+| `exclude_paths` | *(empty)* | git glob patterns whose contents are never sent, in either mode; see below |
 | `prompt_extra` | *(empty)* | one or two sentences of repo-specific risk weighting |
 | `pricing` | Terra + K3 | JSON keyed by model id, for the cost footer |
 | `warn_input_tokens` | `250000` | |
@@ -181,6 +182,55 @@ the whole ceiling reasoning, before any visible text, fails with a message
 naming `*_max_completion_tokens` rather than posting an empty digest. Set it
 alongside the effort, as the example stub shows (`'128000'`).
 
+### `exclude_paths`: files whose contents never leave the repository
+
+A comma separated list of git glob patterns (`**` crosses directories), for
+example `research/**,docs/previews/**/*.html`. In **both** modes, the contents
+of matching files are never put in the model input: delta drops them from the
+diff with a pathspec, and full mode skips them while walking the tree, even
+when `include_docs` is on. Typical uses are raw research output, hand-made
+preview pages, and files a repository has decided must not go to an outside
+model.
+
+The setting changes the input in two visible ways:
+
+- **Names are listed.** Each review gets a "not shown" list naming every left
+  out file and why: excluded by this setting, a lockfile, or a binary
+  extension. The posted digest header gives only the count.
+- **Typos are flagged.** An entry that matches no tracked file is flagged in the
+  header as a likely typo, because a typo would otherwise send exactly what it
+  was meant to hold back.
+
+Entries that would crash every run or quietly empty the review are refused
+before anything is sent: an absolute path, a `..` segment, a leading `:`
+(pathspec magic), or a pattern made only of `*` and `/` (or `.`).
+
+**What it does not cover.**
+- **File names and commit subjects still go out.** The commit list and the
+  not-shown list carry them.
+- **Earlier runs and other workflows are untouched.** It changes nothing about
+  what earlier runs already sent, or about any other workflow.
+- **It does not remove anything from git.** Contents that must not exist in the
+  repository at all need to be removed from it; this setting only stops this
+  digest from reading them.
+
+**Changes every caller gets on this version, with or without the setting:**
+- **Lockfiles and binaries are named.** The delta not-shown list names the
+  lockfiles and binary files a range changed. A model that sees `package.json`
+  change with no lockfile in the diff otherwise reports a missing lockfile
+  update.
+- **Chunks repeat the preamble.** Every chunk of a chunked run repeats the
+  commit list and the not-shown list, not just the first.
+- **Nothing reviewable means no model call.** When a range changed only
+  excluded files, lockfiles or binaries, the digest posts a heartbeat instead
+  of paying a model to review an empty diff. Like the quiet-period heartbeat it
+  carries no marker, so the cursor stays put and the next run covers those
+  commits again.
+
+**Pinning order.** A caller that passes `exclude_paths` to a hub version that
+does not declare it fails when the workflow loads. Add the input in the same
+commit as the repin, and remove it before pinning back to an older hub SHA.
+
 ---
 
 ## How the state machine works
@@ -211,6 +261,8 @@ Loud fallbacks, never quiet ones:
   cron, so every scheduled run posts something.
 - Model or plumbing failure: exit 1, post nothing. A hollow digest would advance
   the cursor over an unreviewed range.
+- Commits in range, but nothing reviewable once excluded paths, lockfiles and
+  binaries are left out: a heartbeat with **no** marker and **no** API call.
 - `finish_reason=length`: posts **with** a truncation banner. Disclosed partial
   coverage beats silence.
 

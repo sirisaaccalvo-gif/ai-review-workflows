@@ -151,6 +151,25 @@ const ASSIGNEE = str('DIGEST_ASSIGNEE', OWNER)
 // because repos disagree about which directories hold prose, and not every repo
 // has all of them.
 const DOCS_PATHS = str('DIGEST_DOCS_PATHS', 'docs/,.planning/').split(',').map((s) => s.trim()).filter(Boolean)
+// Paths whose CONTENTS this repository's digest never sends, in either mode:
+// raw research output, hand-made previews, or files a repo has decided must
+// not leave it. Comma separated git glob pathspecs (`**` crosses directories).
+// Checked before anything runs, because a bad entry either crashes every run
+// (git rejects an absolute or `..` path as outside the repository, so every
+// cron fails) or quietly empties the review (`**`) while the cursor advances.
+const EXCLUDE_PATHS = str('DIGEST_EXCLUDE_PATHS', '').split(',').map((s) => s.trim()).filter(Boolean)
+for (const p of EXCLUDE_PATHS) {
+  const bad = /[\0\r\n]/.test(p) ? 'contains a control character'
+    : p.startsWith('/') ? 'is an absolute path'
+    : p.startsWith(':') ? 'starts with git pathspec magic'
+    : p.split('/').includes('..') ? 'points outside the repository'
+    : /^[*/]+$/.test(p) || /^\.\/?$/.test(p) ? 'would exclude every file'
+    : null
+  if (bad) fail(`exclude_paths entry "${p.slice(0, 120)}" ${bad}; refusing to run (nothing was sent)`)
+}
+// The delta diff has always dropped lockfiles by pathspec; the same globs name
+// them in the not-shown list below, so the two can never disagree.
+const LOCKFILE_GLOBS = ['*package-lock.json', '*.lock', '*pnpm-lock.yaml', '*bun.lockb', '*go.sum']
 // Regex alternation body, not a plain list: the defaults need `jpe?g` and
 // `woff2?`. Callers extend it: a repo whose svg files are exported vector art
 // rather than hand-written markup will want to add `svg`, since a single
@@ -347,7 +366,34 @@ const carried = readCarried(previousComments)
 
 // ── build the review input ──────────────────────────────────────────────────
 const notes = [] // disclosure lines that go in the digest header
-let inputText = ''
+// The review input is a preamble (commit list, files not shown, heading) and a
+// review body (diff sections or file sections). Only the body is split when a run is
+// chunked; every chunk repeats the preamble, so no chunk reviews code without
+// the commit list or the list of files deliberately left out.
+let preamble = ''
+let reviewBody = ''
+// Changed or tracked files whose contents are not sent, with the reason, for
+// the not-shown section. Names only, never contents.
+const notShown = []
+const notShownSection = (title, lead) => {
+  if (!notShown.length) return ''
+  const CAP = 300
+  const lines = notShown.slice(0, CAP).map(([f, why]) => `- \`${f}\` (${why})`)
+  if (notShown.length > CAP) lines.push(`- and ${notShown.length - CAP} more`)
+  return `## ${title}\n${lead}\n${lines.join('\n')}\n\n`
+}
+// Tracked files matched by exclude_paths. An entry that matches nothing is
+// almost always a typo, which would otherwise send exactly what it was meant
+// to hold back, so it is reported rather than ignored.
+const excludedTracked = new Set()
+for (const p of EXCLUDE_PATHS) {
+  const hits = (await git('ls-files', '-z', '--', `:(glob)${p}`)).split('\0').filter(Boolean)
+  if (!hits.length) {
+    console.log(`::warning::exclude_paths entry "${p}" matches no tracked file; check it for a typo`)
+    notes.push(`⚠️ \`exclude_paths\` entry \`${p}\` matches no tracked file; check it for a typo`)
+  }
+  for (const h of hits) excludedTracked.add(h)
+}
 let rangeLabel = ''
 let base = null
 
@@ -392,7 +438,8 @@ if (MODE === 'delta') {
   const log = (await git('log', '--oneline', '--no-decorate', `${base}..${head}`)).trim()
   const commitCount = log ? log.split('\n').length : 0
   const rawDiff = await git('diff', `${base}..${head}`, '--', '.',
-    ':(exclude)*package-lock.json', ':(exclude)*.lock', ':(exclude)*pnpm-lock.yaml', ':(exclude)*bun.lockb', ':(exclude)*go.sum')
+    ...LOCKFILE_GLOBS.map((g) => `:(exclude)${g}`),
+    ...EXCLUDE_PATHS.map((p) => `:(exclude,glob)${p}`))
   // Git prints a TEXT diff for any file its NUL-byte heuristic does not flag as
   // binary, and a PDF built from HTML passes that heuristic. One such PDF put
   // 2.4 million characters of stream data into a delta diff; the chars/4
@@ -419,8 +466,39 @@ if (MODE === 'delta') {
     const shown = excluded.slice(0, 5).map((f) => `\`${f}\``).join(', ')
     notes.push(`ℹ️ excluded ${excluded.length} changed file(s) with a binary extension from the diff: ${shown}${excluded.length > 5 ? `, and ${excluded.length - 5} more` : ''}`)
   }
+  // Name every changed file whose contents are left out, so the model does not
+  // report a lockfile or an excluded file as missing (a package.json change
+  // with no visible lockfile change has already produced a false High). Asked
+  // of git with the same pathspecs the diff used, so the list and the diff
+  // cannot disagree about which files matched.
+  const changedMatching = async (specs) => specs.length
+    ? (await git('diff', '--name-only', '-z', `${base}..${head}`, '--', ...specs)).split('\0').filter(Boolean)
+    : []
+  const listed = new Set()
+  const add = (f, why) => { if (!listed.has(f)) { listed.add(f); notShown.push([f, why]) } }
+  const byRepo = await changedMatching(EXCLUDE_PATHS.map((p) => `:(glob)${p}`))
+  for (const f of byRepo) add(f, "excluded by this repository's exclude_paths")
+  for (const f of await changedMatching(LOCKFILE_GLOBS)) add(f, 'lockfile')
+  for (const f of excluded) add(f, 'binary extension')
+  if (byRepo.length) notes.push(`ℹ️ ${byRepo.length} changed file(s) not sent because of this repository's \`exclude_paths\``)
+  // Nothing left to review: every change in range is excluded, a lockfile or a
+  // binary. A paid call would review a commit list and a list of names, and
+  // could only invent findings from them. Post a heartbeat instead. Like the
+  // quiet-period heartbeat it carries no marker, so the cursor stays where it
+  // is; the next run covers these commits again and skips the same files.
+  if (!diff.trim()) {
+    const heartbeat = [
+      `🫀 Nothing reviewable: ${commitCount} commit(s) on \`${defaultBranch}\` since \`${short(base)}\` changed only files this digest does not send (${notShown.length} file(s): excluded paths, lockfiles or binary files). No model call; cursor unchanged (checked ${today}).`,
+      ...(notes.length ? ['', notes.map((n) => `> ${n}`).join('\n')] : []),
+    ].join('\n')
+    await deliver(heartbeat, { heartbeat: true })
+    process.exit(0)
+  }
   rangeLabel = `\`${short(base)}..${short(head)}\`, ${commitCount} commits`
-  inputText = `## Commits in range\n${log}\n\n## Combined diff (lockfiles and binary extensions excluded)\n${diff}`
+  preamble = `## Commits in range\n${log}\n\n`
+    + notShownSection('Changed in range but not shown', 'These files changed in this range, but their contents are deliberately not included below. Do not report them as missing, and do not treat a change shown below as unmatched because its counterpart is in this list.')
+    + '## Combined diff (lockfiles and binary extensions excluded)\n'
+  reviewBody = diff
 } else {
   // full: the tracked code corpus at HEAD. Code-only by default; the docs paths
   // are opt-in because they are prose and can dwarf the code.
@@ -454,7 +532,10 @@ if (MODE === 'delta') {
       continue
     }
     if (BINARY.test(f) || LOCKFILES.has(path.basename(f)) || f.endsWith('.lock')) continue
-    if (DOCS_PATHS.some((p) => f.startsWith(p))) { if (INCLUDE_DOCS) files.push(f); continue }
+    if (DOCS_PATHS.some((p) => f.startsWith(p)) && !INCLUDE_DOCS) continue
+    // After the docs gate, so only files that would otherwise have been read
+    // are listed; include_docs never overrides this repository's exclusions.
+    if (excludedTracked.has(f)) { notShown.push([f, "excluded by this repository's exclude_paths"]); continue }
     files.push(f)
   }
   if (skipped.symlink) notes.push(`ℹ️ skipped ${skipped.symlink} tracked symlink(s); the corpus only includes regular files`)
@@ -481,7 +562,9 @@ if (MODE === 'delta') {
     }
     parts.push(`### File: ${f}\n\`\`\`\n${fs.readFileSync(real, 'utf8')}\n\`\`\``)
   }
-  inputText = parts.join('\n')
+  preamble = notShownSection('Tracked files not shown', "These tracked files are deliberately left out of this review by the repository's settings. Do not report them as missing.")
+  reviewBody = parts.join('\n')
+  if (notShown.length) notes.push(`ℹ️ ${notShown.length} tracked file(s) not sent because of this repository's \`exclude_paths\``)
   if (escaped) notes.push(`⚠️ ${escaped} tracked path(s) resolved outside the repository and were excluded; nothing outside \`${CALLER_DIR}\` is ever sent to the model`)
   if (dropped) notes.push(`ℹ️ skipped ${dropped} tracked path(s) that are not regular files in the working tree`)
   // parts.length, not files.length: the guards above can drop entries the index
@@ -495,6 +578,7 @@ if (MODE === 'delta') {
   }
 }
 
+const inputText = preamble + reviewBody
 const inputTokens = estTokens(inputText)
 if (inputTokens > WARN_INPUT_TOKENS) {
   // Context quality is the reason this line exists now that the long-context
@@ -517,24 +601,28 @@ if (inputTokens <= CHUNK_INPUT_TOKENS) {
   // would yield one oversized chunk sent anyway; and since a failed run never
   // advances the cursor, an over-ceiling period would then fail every cycle
   // until rescued.
-  const sections = MODE === 'full'
-    ? inputText.split(/(?=^### File: )/m)
-    : inputText.split(/(?=^diff --git )/m)
-  // A single section larger than the ceiling cannot be packed and would ship as
+  const sections = (MODE === 'full'
+    ? reviewBody.split(/(?=^### File: )/m)
+    : reviewBody.split(/(?=^diff --git )/m)).filter(Boolean)
+  // Every chunk carries the preamble, so the room left for code is the ceiling
+  // minus the preamble.
+  const room = CHUNK_INPUT_TOKENS - estTokens(preamble)
+  if (room <= 0) fail(`the commit list and not-shown list alone (~${num(estTokens(preamble))} tokens) exceed the ${num(CHUNK_INPUT_TOKENS)}-token chunk ceiling; raise chunk_input_tokens`)
+  // A single section larger than the room cannot be packed and would ship as
   // an unbounded request that fails every run without moving the cursor. Fail
   // loudly with the culprits named; the fix is a pathspec exclusion or a
   // deliberate ceiling bump.
-  const oversized = sections.filter((s) => estTokens(s) > CHUNK_INPUT_TOKENS)
+  const oversized = sections.filter((s) => estTokens(s) > room)
   if (oversized.length) {
     const names = oversized.map((s) => s.split('\n', 1)[0].slice(0, 120))
     fail(`${oversized.length} single file section(s) exceed the ${num(CHUNK_INPUT_TOKENS)}-token chunk ceiling and cannot be packed: ${names.join(' | ')}`)
   }
   let current = ''
   for (const s of sections) {
-    if (current && estTokens(current) + estTokens(s) > CHUNK_INPUT_TOKENS) { chunks.push(current); current = '' }
+    if (current && estTokens(current) + estTokens(s) > room) { chunks.push(preamble + current); current = '' }
     current += s
   }
-  if (current) chunks.push(current)
+  if (current) chunks.push(preamble + current)
   notes.push(`⚠️ input ~${num(inputTokens)} tokens exceeded the ${num(CHUNK_INPUT_TOKENS)} single-call ceiling; reviewed in ${chunks.length} file-boundary chunks (cross-chunk interactions not visible to the model)`)
 }
 

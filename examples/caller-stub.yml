@@ -78,6 +78,7 @@ jobs:
       #   delta_max_completion_tokens: '128000'  # reasoning counts against
       #                                # the ceiling; max needs room
       #   docs_paths: 'docs/'          # narrow the prose paths for this repo
+      #   exclude_paths: 'research/**'  # never send these files' contents
       #   prompt_extra: 'This codebase has runtime attack surface: weight the
       #     review toward prompt-injection paths, secret and credential
       #     handling, input validation, and authentication logic.'

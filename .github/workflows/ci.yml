@@ -630,6 +630,7 @@ jobs:
           const chunk = (delta, finish_reason = null) => ({ choices: [{ delta, finish_reason }] })
           const chat = {
             'mock-ok': [chunk({ content: FINDING + '- [ ] **Low - a.mjs**: MOCKCHATTEXT\n' }), chunk({}, 'stop')],
+            'mock-trunc': [chunk({ content: FINDING + '- [ ] **Low - a.mjs**: MOCKCHATTRUNC cut sho' }, 'length')],
             'mock-trunc-empty': [chunk({}, 'length')],
             'mock-noterm': [chunk({ content: 'MOCKLEAKCHATNOTERM' })],
           }
@@ -746,6 +747,7 @@ jobs:
 
           echo "::group::responses, truncated at max_output_tokens"
           run_mock responses mock-trunc "$mock/trunc.out" || { cat "$mock/trunc.out"; exit 1; }
+          grep -q 'cut sho' "$mock/trunc.out" || { echo "::error::responses truncated text missing from the digest"; exit 1; }
           grep -q 'output-token ceiling' "$mock/trunc.out" || { echo "::error::max_output_tokens did not take the disclosed-truncation path"; cat "$mock/trunc.out"; exit 1; }
           echo "::endgroup::"
 
@@ -786,6 +788,9 @@ jobs:
               print("::error::an unset DIGEST_API must keep the chat request shape: " + "; ".join(problems)); sys.exit(1)
           print("default chat request shape ok, same prompt as the responses path")
           PY
+          run_mock '' mock-trunc "$mock/chat-trunc.out" || { cat "$mock/chat-trunc.out"; exit 1; }
+          grep -q 'MOCKCHATTRUNC' "$mock/chat-trunc.out" || { echo "::error::chat truncated text missing from the digest"; exit 1; }
+          grep -q 'output-token ceiling' "$mock/chat-trunc.out" || { echo "::error::chat finish_reason=length did not take the disclosed-truncation path"; cat "$mock/chat-trunc.out"; exit 1; }
           expect_fail "chat, the ceiling reached before any text" 'raise delta_max_completion_tokens' '' '' mock-trunc-empty "$mock/chat-trunc-empty.out"
           expect_fail "chat, a stream with no terminal event" 'finish_reason=null' MOCKLEAKCHATNOTERM '' mock-noterm "$mock/chat-noterm.out"
           echo "::endgroup::"

@@ -571,7 +571,7 @@ jobs:
           # original design assumed it could do.
           CENTRAL_REPO: ${{ steps.cfg.outputs.central_repo }}
           CENTRAL_REF: ${{ steps.cfg.outputs.central_ref }}
-          EXPECTED_ASSETS_SHA256: 'e89b1c882b7e3b5584762bde0780430d1207d6fa7ee0939e8e671499c96fa9f8'
+          EXPECTED_ASSETS_SHA256: '2336626a31c63956887e2b5588169990e40aa2d498ee05d0fdd941e849bacf74'
         run: |
           set -euo pipefail
           missing=0

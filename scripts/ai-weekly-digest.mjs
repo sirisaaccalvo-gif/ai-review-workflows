@@ -729,15 +729,22 @@ async function callModel(user, attempt = 1) {
       if (choice?.finish_reason) finish = choice.finish_reason
       if (chunk.usage) usage = chunk.usage
     }
-    for await (const bytes of res.body) {
-      buf += decoder.decode(bytes, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop()
-      for (const line of lines) {
-        consume(line)
+    try {
+      for await (const bytes of res.body) {
+        buf += decoder.decode(bytes, { stream: true })
+        const lines = buf.split('\n')
+        buf = lines.pop()
+        for (const line of lines) {
+          consume(line)
+          if (terminal) break
+        }
         if (terminal) break
       }
-      if (terminal) break
+    } catch (err) {
+      // Once a terminal event is in hand the outcome is decided; an error
+      // from cancelling or tearing down the rest of the body must not send a
+      // finished answer to the retry path.
+      if (!terminal) throw err
     }
     // Flush: a stream that ends without a trailing newline leaves its last line
     // in buf (and possibly bytes in the decoder). Both endpoints end their last

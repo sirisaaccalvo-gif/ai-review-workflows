@@ -184,30 +184,40 @@ alongside the effort, as the example stub shows (`'128000'`).
 
 ### `exclude_paths`: files whose contents never leave the repository
 
-A comma separated list of git glob patterns (`**` crosses directories), for
-example `research/**,docs/previews/**/*.html`. In **both** modes, the contents
-of matching files are never put in the model input: delta drops them from the
-diff with a pathspec, and full mode skips them while walking the tree, even
-when `include_docs` is on. Typical uses are raw research output, hand-made
+A comma separated list of git glob patterns (`**` crosses directories),
+matched against paths from the repository root, case sensitively, for
+example `research/**,docs/previews/**/*.html`. In **both** modes this digest
+does not send the contents of matching files: delta drops them from the diff
+with a pathspec, and full mode skips them while walking the tree, even when
+`include_docs` is on. Typical uses are raw research output, hand-made
 preview pages, and files a repository has decided must not go to an outside
 model.
 
-The setting changes the input in two visible ways:
+- **Moves across the boundary are held back too.** Git filters pathspecs
+  before it detects renames, so a file moved INTO an excluded folder would
+  otherwise show its old contents as deleted lines, and one moved out would
+  show them as added. Both sides of any rename that touches an excluded path
+  are left out of that range. Deleted excluded files are left out as well.
+- **Names are listed.** The delta review gets a "not shown" list naming every
+  changed file it left out and why: excluded by this setting, renamed to or
+  from an excluded path, a lockfile, or a binary extension. In full mode the
+  list names the tracked files this setting held back. The posted digest
+  header gives only the count.
+- **It fails closed.** An entry that matches nothing stops the run before
+  anything is sent, in either mode. "Nothing" means no tracked file, and in
+  delta also no file changed in the range. A typo or a wrong-case path would
+  otherwise send exactly what it was meant to hold back.
+- **Bad entries are refused.** Malformed entries also stop the run before
+  anything is sent: a control character, a backslash, an absolute path, a
+  leading `./`, a `..` segment, a leading `:` (pathspec magic), or a pattern
+  made only of `*` and `/`.
 
-- **Names are listed.** Each review gets a "not shown" list naming every left
-  out file and why: excluded by this setting, a lockfile, or a binary
-  extension. The posted digest header gives only the count.
-- **Typos are flagged.** An entry that matches no tracked file is flagged in the
-  header as a likely typo, because a typo would otherwise send exactly what it
-  was meant to hold back.
-
-Entries that would crash every run or quietly empty the review are refused
-before anything is sent: an absolute path, a `..` segment, a leading `:`
-(pathspec magic), or a pattern made only of `*` and `/` (or `.`).
-
-**What it does not cover.**
+**What it does not cover.** It is a path filter for this digest, not a
+data-protection boundary for the repository:
 - **File names and commit subjects still go out.** The commit list and the
   not-shown list carry them.
+- **Copies are not followed.** Content copied or pasted into a file outside
+  the patterns is sent like any other content.
 - **Earlier runs and other workflows are untouched.** It changes nothing about
   what earlier runs already sent, or about any other workflow.
 - **It does not remove anything from git.** Contents that must not exist in the
@@ -225,7 +235,8 @@ before anything is sent: an absolute path, a `..` segment, a leading `:`
   excluded files, lockfiles or binaries, the digest posts a heartbeat instead
   of paying a model to review an empty diff. Like the quiet-period heartbeat it
   carries no marker, so the cursor stays put and the next run covers those
-  commits again.
+  commits again. A repository whose changes are all lockfile bumps for a
+  while gets one heartbeat per run until something reviewable lands.
 
 **Pinning order.** A caller that passes `exclude_paths` to a hub version that
 does not declare it fails when the workflow loads. Add the input in the same

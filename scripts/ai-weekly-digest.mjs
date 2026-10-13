@@ -159,11 +159,13 @@ const DOCS_PATHS = str('DIGEST_DOCS_PATHS', 'docs/,.planning/').split(',').map((
 // cron fails) or quietly empties the review (`**`) while the cursor advances.
 const EXCLUDE_PATHS = str('DIGEST_EXCLUDE_PATHS', '').split(',').map((s) => s.trim()).filter(Boolean)
 for (const p of EXCLUDE_PATHS) {
-  const bad = /[\0\r\n]/.test(p) ? 'contains a control character'
+  const bad = /[\x00-\x1f\x7f]/.test(p) ? 'contains a control character'
+    : p.includes('\\') ? 'contains a backslash (git paths use forward slashes)'
     : p.startsWith('/') ? 'is an absolute path'
     : p.startsWith(':') ? 'starts with git pathspec magic'
+    : /^\.(\/|$)/.test(p) ? 'starts with "./" (write it from the repository root)'
     : p.split('/').includes('..') ? 'points outside the repository'
-    : /^[*/]+$/.test(p) || /^\.\/?$/.test(p) ? 'would exclude every file'
+    : /^[*/]+$/.test(p) ? 'would exclude every file'
     : null
   if (bad) fail(`exclude_paths entry "${p.slice(0, 120)}" ${bad}; refusing to run (nothing was sent)`)
 }
@@ -382,18 +384,18 @@ const notShownSection = (title, lead) => {
   if (notShown.length > CAP) lines.push(`- and ${notShown.length - CAP} more`)
   return `## ${title}\n${lead}\n${lines.join('\n')}\n\n`
 }
-// Tracked files matched by exclude_paths. An entry that matches nothing is
-// almost always a typo, which would otherwise send exactly what it was meant
-// to hold back, so it is reported rather than ignored.
+// Tracked files matched by exclude_paths, and how many each entry matched.
+// An entry that matches nothing is almost always a typo or a wrong-case path,
+// and a typo would send exactly what it was meant to hold back, so the run
+// refuses to start (see unmatched() below) instead of warning and sending.
 const excludedTracked = new Set()
+const trackedHits = new Map()
 for (const p of EXCLUDE_PATHS) {
   const hits = (await git('ls-files', '-z', '--', `:(glob)${p}`)).split('\0').filter(Boolean)
-  if (!hits.length) {
-    console.log(`::warning::exclude_paths entry "${p}" matches no tracked file; check it for a typo`)
-    notes.push(`⚠️ \`exclude_paths\` entry \`${p}\` matches no tracked file; check it for a typo`)
-  }
+  trackedHits.set(p, hits.length)
   for (const h of hits) excludedTracked.add(h)
 }
+const unmatched = (p, where) => fail(`exclude_paths entry "${p}" matches no ${where}; fix it (a typo would send what it was meant to hold back) or remove it. Nothing was sent.`)
 let rangeLabel = ''
 let base = null
 
@@ -437,9 +439,41 @@ if (MODE === 'delta') {
   }
   const log = (await git('log', '--oneline', '--no-decorate', `${base}..${head}`)).trim()
   const commitCount = log ? log.split('\n').length : 0
+  // --no-renames so both sides of a rename count: a path deleted or renamed
+  // away in this range still matches.
+  const changedMatching = async (specs, ...flags) => specs.length
+    ? (await git('diff', '--name-only', ...flags, '-z', `${base}..${head}`, '--', ...specs)).split('\0').filter(Boolean)
+    : []
+  const byRepo = new Set()
+  for (const p of EXCLUDE_PATHS) {
+    const inRange = await changedMatching([`:(glob)${p}`], '--no-renames')
+    if (!trackedHits.get(p) && !inRange.length) unmatched(p, 'tracked file and no file changed in this range')
+    for (const f of inRange) byRepo.add(f)
+  }
+  // Pathspecs filter BEFORE rename detection, so a rename across the boundary
+  // would show the far side in full: moving a file INTO an excluded folder
+  // shows its old contents as deleted lines, and moving one out shows it as
+  // added. Both sides of any rename that touches an excluded path are left out.
+  const pairedAway = []
+  if (byRepo.size) {
+    const recs = (await git('diff', '-M', '--name-status', '-z', `${base}..${head}`)).split('\0')
+    for (let i = 0; i < recs.length;) {
+      const st = recs[i]
+      if (!st) { i++; continue }
+      if (st[0] === 'R' || st[0] === 'C') {
+        const [from, to] = [recs[i + 1], recs[i + 2]]
+        i += 3
+        if (byRepo.has(from) && !byRepo.has(to)) pairedAway.push(to)
+        if (byRepo.has(to) && !byRepo.has(from)) pairedAway.push(from)
+      } else {
+        i += 2
+      }
+    }
+  }
   const rawDiff = await git('diff', `${base}..${head}`, '--', '.',
     ...LOCKFILE_GLOBS.map((g) => `:(exclude)${g}`),
-    ...EXCLUDE_PATHS.map((p) => `:(exclude,glob)${p}`))
+    ...EXCLUDE_PATHS.map((p) => `:(exclude,glob)${p}`),
+    ...pairedAway.map((f) => `:(exclude,literal)${f}`))
   // Git prints a TEXT diff for any file its NUL-byte heuristic does not flag as
   // binary, and a PDF built from HTML passes that heuristic. One such PDF put
   // 2.4 million characters of stream data into a delta diff; the chars/4
@@ -471,16 +505,14 @@ if (MODE === 'delta') {
   // with no visible lockfile change has already produced a false High). Asked
   // of git with the same pathspecs the diff used, so the list and the diff
   // cannot disagree about which files matched.
-  const changedMatching = async (specs) => specs.length
-    ? (await git('diff', '--name-only', '-z', `${base}..${head}`, '--', ...specs)).split('\0').filter(Boolean)
-    : []
   const listed = new Set()
   const add = (f, why) => { if (!listed.has(f)) { listed.add(f); notShown.push([f, why]) } }
-  const byRepo = await changedMatching(EXCLUDE_PATHS.map((p) => `:(glob)${p}`))
   for (const f of byRepo) add(f, "excluded by this repository's exclude_paths")
+  for (const f of pairedAway) add(f, 'renamed to or from an excluded path')
   for (const f of await changedMatching(LOCKFILE_GLOBS)) add(f, 'lockfile')
   for (const f of excluded) add(f, 'binary extension')
-  if (byRepo.length) notes.push(`ℹ️ ${byRepo.length} changed file(s) not sent because of this repository's \`exclude_paths\``)
+  const heldBack = byRepo.size + pairedAway.length
+  if (heldBack) notes.push(`ℹ️ ${heldBack} changed file(s) not sent because of this repository's \`exclude_paths\``)
   // Nothing left to review: every change in range is excluded, a lockfile or a
   // binary. A paid call would review a commit list and a list of names, and
   // could only invent findings from them. Post a heartbeat instead. Like the
@@ -516,6 +548,7 @@ if (MODE === 'delta') {
   //    below backstops it in case the working tree diverges from the index.
   // 2. CORRECTNESS. -z is NUL delimited, so paths containing newlines (legal in
   //    git) do not silently split into two bogus entries.
+  for (const p of EXCLUDE_PATHS) if (!trackedHits.get(p)) unmatched(p, 'tracked file')
   const READABLE_MODES = new Set(['100644', '100755'])
   const skipped = { symlink: 0, submodule: 0 }
   const files = []

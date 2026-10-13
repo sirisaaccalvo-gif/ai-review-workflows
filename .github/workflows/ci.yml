@@ -809,9 +809,10 @@ jobs:
         # reach an outside model. These stub runs inspect the composed prompt
         # (the only place reviewed contents appear) in delta and full mode,
         # with and without the setting, and pin the fail-closed rules: malformed
-        # entries stop before anything is sent, a typo is reported, a range with
-        # nothing reviewable posts a heartbeat without a model call or a cursor,
-        # and every chunk repeats the commit list and the not-shown list.
+        # or unmatched entries stop before anything is sent, moves across the
+        # boundary and deletions leak nothing, a range with nothing reviewable
+        # posts a heartbeat without a model call or a cursor, and every chunk
+        # repeats the commit list and the not-shown list.
         run: |
           set -euo pipefail
           # exclude_paths: contents of excluded files must never reach the prompt, in
@@ -846,6 +847,21 @@ jobs:
           printf '{"lockfileVersion":3,"x":"LOCKMARKER"}\n' > package-lock.json
           printf 'not really a png\n' > assets/pic.png
           finish "a change everywhere"
+
+          # Fixture 3: moves across the boundary and a deleted excluded file. Git
+          # filters pathspecs before rename detection, so without pairing a move INTO
+          # secret/ shows the old contents as deleted lines and a move OUT shows them
+          # as added.
+          mkrepo "$x/fr"
+          printf 'MOVEDIN line1\nline2\nline3\n' > src/notes.md
+          printf 'MOVEDOUT a\nb\nc\n' > secret/old.md
+          printf 'GONESECRET\n' > secret/gone.md
+          git add -A && GIT_AUTHOR_DATE="$old" GIT_COMMITTER_DATE="$old" git commit -qm "more base"
+          git mv src/notes.md secret/notes.md
+          git mv secret/old.md src/old.md
+          git rm -q secret/gone.md
+          printf 'export const v = 3 // RENAMECODE\n' > src/app.mjs
+          finish "moves across the boundary"
 
           # Fixture 2: a range that changes only excluded files and a lockfile.
           mkrepo "$x/fq"
@@ -907,7 +923,7 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::malformed entries fail before anything is sent"
-          for bad in '/etc/**' '../up/**' ':(top)src/**' '**' '*' '.' 'src/**,**/*'; do
+          for bad in '/etc/**' '../up/**' ':(top)src/**' '**' '*' '.' './**' 'secret\\**' "$(printf 'secret/**\tx')" 'src/**,**/*'; do
             if run "$x/fx" delta "$bad" "$x/bad"; then echo "::error::exclude_paths '$bad' was accepted"; exit 1; fi
             has "$x/bad.out" 'exclude_paths entry' "the rejection names the setting for '$bad'"
             [ ! -s "$x/bad.prompt" ] || { echo "::error::a prompt was composed for '$bad'"; exit 1; }
@@ -915,10 +931,24 @@ jobs:
           echo "  rejected every malformed entry"
           echo "::endgroup::"
 
-          echo "::group::an entry that matches nothing is reported"
-          run "$x/fx" delta 'secrte/**' "$x/typo" || { cat "$x/typo.out"; exit 1; }
-          has "$x/typo.out" "\`secrte/**\` matches no tracked file" "the typo warning"
-          has "$x/typo.prompt" SECRETNEW "a typo excludes nothing"
+          echo "::group::an entry that matches nothing stops the run"
+          for mode in delta full; do
+            if run "$x/fx" "$mode" 'secret/**,secrte/**' "$x/typo"; then echo "::error::$mode ran with a typo in exclude_paths"; exit 1; fi
+            has "$x/typo.out" 'exclude_paths entry "secrte/**" matches no' "the typo is named ($mode)"
+            [ ! -s "$x/typo.prompt" ] || { echo "::error::a prompt was composed despite the typo ($mode)"; exit 1; }
+          done
+          echo "  a typo or wrong-case entry stops both modes before anything is sent"
+          echo "::endgroup::"
+
+          echo "::group::moves across the boundary and deletions"
+          run "$x/fr" delta 'secret/**' "$x/r" || { cat "$x/r.out"; exit 1; }
+          lacks "$x/r.prompt" MOVEDIN "a file moved into an excluded path leaked its old contents"
+          lacks "$x/r.prompt" MOVEDOUT "a file moved out of an excluded path leaked in this range"
+          lacks "$x/r.prompt" GONESECRET "a deleted excluded file leaked as removed lines"
+          has "$x/r.prompt" RENAMECODE "the unrelated code change"
+          has "$x/r.prompt" "- \`src/notes.md\` (renamed to or from an excluded path)" "the far side of a move in"
+          has "$x/r.prompt" "- \`src/old.md\` (renamed to or from an excluded path)" "the far side of a move out"
+          has "$x/r.prompt" "- \`secret/gone.md\` (excluded by this repository's exclude_paths)" "the deleted file is named"
           echo "::endgroup::"
 
           echo "::group::nothing reviewable: no model call, no cursor"
@@ -936,4 +966,4 @@ jobs:
           [ "$(grep -c '^## Changed in range but not shown' "$x/c.prompt")" = "$chunks" ] || { echo "::error::the not-shown list is not in every chunk"; exit 1; }
           echo "  $chunks chunks, each with the commit list and the not-shown list"
           echo "::endgroup::"
-          echo "exclude_paths holds in both modes, names everything left out, and fails closed on malformed entries"
+          echo "exclude_paths holds in both modes and across moves, names everything left out, and fails closed on malformed or unmatched entries"

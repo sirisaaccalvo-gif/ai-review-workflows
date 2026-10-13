@@ -640,23 +640,33 @@ async function callModel(user, attempt = 1) {
       return callModel(user, 2)
     }
     if (!res.ok) fail(`model API error ${res.status}: ${(await res.text()).slice(0, 300)}`)
-    // Minimal SSE accumulator, dependency-free like the rest of this script:
-    // "data: {json}" lines terminated by "data: [DONE]". Visible text arrives in
-    // choices[0].delta.content (reasoning deltas keep the connection warm but
-    // are not part of the digest); finish_reason rides the last content chunk;
-    // usage rides a final chunk with empty choices. A partial line at a read
-    // boundary is carried over, and a malformed data line throws so the outer
-    // catch gets the same one-retry the old whole-body JSON parse path had.
+    // Minimal SSE accumulator, dependency-free like the rest of this script.
+    // Chat: "data: {json}" lines terminated by "data: [DONE]". Visible text
+    // arrives in choices[0].delta.content (reasoning deltas keep the connection
+    // warm but are not part of the digest); finish_reason rides the last content
+    // chunk; usage rides a final chunk with empty choices. Responses: typed
+    // events, see consumeResponses. A partial line at a read boundary is
+    // carried over, and a malformed data line throws so the outer catch gets
+    // the same one-retry the old whole-body JSON parse path had.
     let content = ''
     let finish = null
     let usage = null
     let streamError = null
+    // Set by the first Responses terminal event. The outcome is decided there:
+    // a later event cannot overwrite it (a stray completed after an error would
+    // otherwise turn a failure into a post), and the read loop stops, so a
+    // transport hiccup after the answer is complete cannot trigger a second,
+    // billed attempt. Chat keeps its original read-to-the-end behavior because
+    // its usage chunk arrives after finish_reason.
+    let terminal = false
     let buf = ''
     const decoder = new TextDecoder()
     // Responses reports input_tokens/output_tokens; the footer, the cost
     // estimate and the totals all read chat's prompt_tokens/completion_tokens,
     // so map once here rather than teaching every reader two shapes.
-    const responsesUsage = (u) => (u
+    // Partial counts would price as NaN or as a wrong number, so anything short
+    // of both totals counts as no usage, which the footer discloses.
+    const responsesUsage = (u) => (Number.isFinite(u?.input_tokens) && Number.isFinite(u?.output_tokens)
       ? {
           prompt_tokens: u.input_tokens,
           completion_tokens: u.output_tokens,
@@ -671,28 +681,35 @@ async function callModel(user, attempt = 1) {
     // output_item and content_part bookkeeping, output_text.done, which repeats
     // the deltas) is ignored.
     const consumeResponses = (chunk) => {
+      if (terminal) return
       switch (chunk.type) {
         case 'response.output_text.delta':
           if (typeof chunk.delta === 'string') content += chunk.delta
           break
         case 'response.completed':
+          terminal = true
           finish = 'stop'
           usage = responsesUsage(chunk.response?.usage)
           break
         case 'response.incomplete': {
+          terminal = true
           const why = chunk.response?.incomplete_details?.reason ?? 'unknown'
           finish = why === 'max_output_tokens' ? 'length' : `incomplete:${why}`
           usage = responsesUsage(chunk.response?.usage)
           break
         }
         case 'response.failed':
+          terminal = true
           finish = 'failed'
           streamError = chunk.response?.error ?? { message: 'response.failed with no error detail' }
           usage = responsesUsage(chunk.response?.usage)
           break
         case 'error':
+          // Documented flat ({type, code, message}); some deployments nest the
+          // same fields under error, as response.failed does.
+          terminal = true
           finish = 'error'
-          streamError = { code: chunk.code ?? null, message: chunk.message ?? null }
+          streamError = chunk.error ?? { code: chunk.code ?? null, message: chunk.message ?? null }
           break
       }
     }
@@ -716,23 +733,37 @@ async function callModel(user, attempt = 1) {
       buf += decoder.decode(bytes, { stream: true })
       const lines = buf.split('\n')
       buf = lines.pop()
-      for (const line of lines) consume(line)
+      for (const line of lines) {
+        consume(line)
+        if (terminal) break
+      }
+      if (terminal) break
     }
     // Flush: a stream that ends without a trailing newline leaves its last line
-    // in buf (and possibly bytes in the decoder). Both endpoints do terminate
-    // with a newline after [DONE], but a proxy that does not would otherwise
-    // silently cost the run its finish_reason and usage chunk and turn a clean
-    // completion into a spurious fail-closed. consume() is reused so the flush
-    // path shares the loop's parse-error handling.
-    buf += decoder.decode()
-    if (buf) consume(buf)
+    // in buf (and possibly bytes in the decoder). Both endpoints end their last
+    // event with a newline (chat's is the [DONE] line; Responses sends no
+    // [DONE] and ends on its terminal event), but a proxy that strips it would
+    // otherwise silently cost the run its terminal event and usage and turn a
+    // clean completion into a spurious fail-closed. consume() is reused so the
+    // flush path shares the loop's parse-error handling.
+    if (!terminal) {
+      buf += decoder.decode()
+      if (buf) consume(buf)
+    }
     // Token accounting also goes to the log, not only the footer: it is the
     // evidence that the effort setting is honored (reasoning tokens move with
     // it), and the log survives a run that fails before it can post.
     console.log(`model usage: ${JSON.stringify(usage ?? {})}`)
-    // Before the hollow-digest check: a failed response usually carries no
-    // text, and its own error is the diagnosis, not "empty review".
-    if (streamError) console.log(`::error::model stream reported ${finish}: ${JSON.stringify(streamError).slice(0, 300)}`)
+    // Both before the hollow-digest check, because each has a better diagnosis
+    // than "empty review". A failed or errored response fails here even when
+    // it streamed some text first: partial output from a failed run is not a
+    // review of the range.
+    if (streamError) fail(`model stream reported ${finish}: ${JSON.stringify(streamError).slice(0, 300)}; not posting (cursor unchanged)`)
+    // At max effort reasoning can spend the whole ceiling before any visible
+    // text, which reads as an empty review but is fixed by a bigger ceiling.
+    if (finish === 'length' && !content.trim()) {
+      fail(`model hit the ${MAX_COMPLETION_TOKENS}-token output ceiling before writing any review text (reasoning counts against it); raise ${MODE}_max_completion_tokens. Not posting (cursor unchanged)`)
+    }
     if (!content.trim()) fail('model returned an empty review; refusing to post a hollow digest (and refusing to advance the cursor)')
     // Fail closed on any termination that is not clean completion or the
     // disclosed-truncation case: a content_filter or unknown finish would

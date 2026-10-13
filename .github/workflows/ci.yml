@@ -79,7 +79,7 @@ jobs:
                 GITHUB_ENV="$RUNNER_TEMP/env.txt" GITHUB_OUTPUT="$RUNNER_TEMP/out.txt" \
                 GITHUB_REPOSITORY=owner/caller \
                 IN_CENTRAL_REF="${1-$SHA}" IN_CENTRAL_REPO="${2-}" IN_MODE="${3-}" IN_NODE_VERSION="${4-}" \
-                IN_DELTA_API="${5-}" IN_DELTA_PROVIDER="${6-}" \
+                IN_DELTA_API="${5-}" IN_DELTA_PROVIDER="${6-}" IN_FULL_API="${7-}" IN_FULL_PROVIDER="${8-}" \
                 bash --noprofile --norc -euo pipefail "$RUNNER_TEMP/resolve.sh"
           }
 
@@ -96,6 +96,15 @@ jobs:
           run_resolve "$SHA" "" "" "" responses
           grep -A1 '^DIGEST_API<<' "$RUNNER_TEMP/env.txt" | grep -qx 'responses'
           grep -A1 '^DIGEST_API_BASE<<' "$RUNNER_TEMP/env.txt" | grep -qx 'https://api.openai.com/v1'
+          echo "::endgroup::"
+
+          echo "::group::full mode reads its own api input"
+          run_resolve "$SHA" "" full "" responses
+          grep -A1 '^DIGEST_API<<' "$RUNNER_TEMP/env.txt" | grep -qx 'chat'
+          grep -q '^key_env=MOONSHOT_API_KEY$' "$RUNNER_TEMP/out.txt"
+          run_resolve "$SHA" "" full "" "" "" responses openai
+          grep -A1 '^DIGEST_API<<' "$RUNNER_TEMP/env.txt" | grep -qx 'responses'
+          grep -q '^key_env=OPENAI_API_KEY$' "$RUNNER_TEMP/out.txt"
           echo "::endgroup::"
 
           # Each of these MUST fail. `run_resolve ... && exit 1` would be
@@ -118,6 +127,7 @@ jobs:
           must_reject "a bogus node_version"                "$SHA" "" "" "24; rm -rf /"
           must_reject "an unknown api"                      "$SHA" "" "" "" "graphql"
           must_reject "responses on a non-openai provider"  "$SHA" "" "" "" "responses" "moonshot"
+          must_reject "full responses on the default provider" "$SHA" "" full "" "" "" "responses"
 
           # The injection attempt must not have reached the outputs.
           run_resolve "$SHA" >/dev/null 2>&1
@@ -550,10 +560,11 @@ jobs:
         # bodies and both stream parsers were untested. This runs the real
         # script, real fetch and real TLS against a local server that replays
         # canned Chat Completions and Responses streams: clean completion,
-        # truncation, every fail-closed terminal, and an HTTP 400. It also pins
-        # that an unset DIGEST_API keeps the chat request shape, since every
-        # existing caller depends on that default. Reuses the fixture repo the
-        # previous step built.
+        # truncation, every fail-closed terminal (each after some streamed
+        # text, which must not reach a digest), a stream with no terminal at
+        # all, and an HTTP 400. It also pins that an unset DIGEST_API keeps the
+        # exact chat request shape, since every existing caller depends on
+        # that default. Reuses the fixture repo the previous step built.
         run: |
           set -euo pipefail
           # Both endpoint paths against a local mock of the provider. No network, no key.
@@ -570,30 +581,57 @@ jobs:
           import https from 'node:https'
           import fs from 'node:fs'
           const dir = process.argv[2]
-          const sse = (o) => `data: ${JSON.stringify(o)}\n\n`
+          // An object becomes one SSE data event; a string is written raw.
+          const sse = (o) => (typeof o === 'string' ? o : `data: ${JSON.stringify(o)}\n\n`)
           const usage = { input_tokens: 1234, output_tokens: 567, output_tokens_details: { reasoning_tokens: 500 } }
+          const text = (delta) => ({ type: 'response.output_text.delta', delta })
+          const FINDING = '1 finding, worst severity: Low\n'
+          const completed = { type: 'response.completed', response: { status: 'completed', usage } }
           // One scenario per model id, so a single server covers every case.
           const responses = {
             'mock-ok': [
               { type: 'response.created', response: { status: 'in_progress' } },
               { type: 'keepalive' },
               { type: 'response.output_item.added', item: { type: 'reasoning' } },
-              { type: 'response.output_text.delta', delta: '1 finding, worst severity: Low\n' },
-              { type: 'response.output_text.delta', delta: '- [ ] **Low - a.mjs**: MOCKRESPONSESTEXT\n' },
+              text(FINDING),
+              text('- [ ] **Low - a.mjs**: MOCKRESPONSESTEXT\n'),
               { type: 'response.output_text.done', text: 'ignored repeat of the deltas' },
-              { type: 'response.completed', response: { status: 'completed', usage } },
+              completed,
+            ],
+            // A line after the terminal event that would throw if parsed: the read loop
+            // must stop at the terminal event, or this costs a second, billed attempt.
+            'mock-junk': [text(FINDING + '- [ ] **Low - a.mjs**: MOCKJUNKTEXT\n'), completed, 'data: {not json\n\n'],
+            'mock-partial-usage': [
+              text(FINDING + '- [ ] **Low - a.mjs**: MOCKPARTIALUSAGE\n'),
+              { type: 'response.completed', response: { status: 'completed', usage: { input_tokens: 1234 } } },
             ],
             'mock-trunc': [
-              { type: 'response.output_text.delta', delta: '1 finding, worst severity: Low\n- [ ] **Low - a.mjs**: cut sho' },
+              text(FINDING + '- [ ] **Low - a.mjs**: cut sho'),
+              { type: 'response.incomplete', response: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, usage } },
+            ],
+            'mock-trunc-empty': [
               { type: 'response.incomplete', response: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, usage } },
             ],
             'mock-filter': [
-              { type: 'response.output_text.delta', delta: 'partial text' },
+              text('MOCKLEAKFILTER'),
               { type: 'response.incomplete', response: { status: 'incomplete', incomplete_details: { reason: 'content_filter' }, usage } },
             ],
             'mock-failed': [
+              text('MOCKLEAKFAILED'),
               { type: 'response.failed', response: { status: 'failed', error: { code: 'server_error', message: 'MOCKFAILURE' } } },
             ],
+            'mock-error': [text('MOCKLEAKERROR'), { type: 'error', code: 'server_error', message: 'MOCKERRFLAT' }],
+            'mock-error-nested': [text('MOCKLEAKNESTED'), { type: 'error', error: { code: 'server_error', message: 'MOCKERRNESTED' } }],
+            // The first terminal event decides: a later completed must not turn an
+            // error into a post.
+            'mock-error-then-completed': [text('MOCKLEAKLATE'), { type: 'error', code: 'server_error', message: 'MOCKERRFIRST' }, completed],
+            'mock-noterm': [text('MOCKLEAKNOTERM')],
+          }
+          const chunk = (delta, finish_reason = null) => ({ choices: [{ delta, finish_reason }] })
+          const chat = {
+            'mock-ok': [chunk({ content: FINDING + '- [ ] **Low - a.mjs**: MOCKCHATTEXT\n' }), chunk({}, 'stop')],
+            'mock-trunc-empty': [chunk({}, 'length')],
+            'mock-noterm': [chunk({ content: 'MOCKLEAKCHATNOTERM' })],
           }
           https.createServer({ key: fs.readFileSync(`${dir}/key.pem`), cert: fs.readFileSync(`${dir}/cert.pem`) }, (req, res) => {
             let raw = ''
@@ -607,22 +645,23 @@ jobs:
                 return res.end('{"error":{"message":"MOCK400 unsupported value"}}')
               }
               res.writeHead(200, { 'content-type': 'text/event-stream' })
-              let text
+              let events
               if (req.url === '/v1/responses') {
-                text = (responses[body.model] ?? []).map(sse).join('')
+                events = responses[body.model] ?? []
               } else {
-                text = [
-                  { choices: [{ delta: { content: '1 finding, worst severity: Low\n- [ ] **Low - a.mjs**: MOCKCHATTEXT\n' } }] },
-                  { choices: [{ delta: {}, finish_reason: 'stop' }] },
-                  { choices: [], usage: { prompt_tokens: 1234, completion_tokens: 567 } },
-                ].map(sse).join('') + 'data: [DONE]\n\n'
+                events = [...(chat[body.model] ?? chat['mock-ok'])]
+                // Like the real endpoint, usage arrives only when the request opts in,
+                // so a dropped stream_options shows up as a missing footer count.
+                if (body.stream_options?.include_usage) events.push({ choices: [], usage: { prompt_tokens: 1234, completion_tokens: 567 } })
+                if (body.model !== 'mock-noterm') events.push('data: [DONE]\n\n')
               }
+              const out = events.map(sse).join('')
               // Uneven writes that split JSON lines mid-object, to exercise the
               // line buffer across read boundaries.
               let i = 0
               const step = () => {
-                if (i >= text.length) return res.end()
-                res.write(text.slice(i, i + 37)); i += 37
+                if (i >= out.length) return res.end()
+                res.write(out.slice(i, i + 37)); i += 37
                 setImmediate(step)
               }
               step()
@@ -651,37 +690,54 @@ jobs:
               DIGEST_PRICING="{\"$2\":{\"in\":1,\"out\":1}}" \
               node scripts/ai-weekly-digest.mjs > "$3" 2>&1
           }
+          # expect_fail LABEL NEEDLE LEAK API MODEL OUT: must exit non-zero, must say
+          # NEEDLE (so it failed for the intended reason), and must not carry LEAK, the
+          # text the mock streamed before failing, into a digest.
           expect_fail() {
-            local label="$1" needle="$2"; shift 2
-            if run_mock "$@"; then echo "::error::$label exited 0; it must fail closed"; exit 1; fi
+            local label="$1" needle="$2" leak="$3"; shift 3
+            if run_mock "$@"; then echo "::error::$label exited 0; it must fail closed"; cat "$3"; exit 1; fi
             grep -qF "$needle" "$3" || { echo "::error::$label failed without '$needle'"; cat "$3"; exit 1; }
+            if [ -n "$leak" ] && grep -qF "$leak" "$3"; then echo "::error::$label put streamed text in a digest"; cat "$3"; exit 1; fi
             echo "  failed closed as required: $label"
           }
+          requests_for() { python3 -c 'import json,sys; print(sum(1 for l in open(sys.argv[1]) if json.loads(l)["body"].get("model")==sys.argv[2]))' "$mock/requests.jsonl" "$1"; }
 
           echo "::group::responses, clean completion"
           run_mock responses mock-ok "$mock/ok.out" || { cat "$mock/ok.out"; exit 1; }
           grep -q 'MOCKRESPONSESTEXT' "$mock/ok.out" || { echo "::error::responses text missing from the digest"; exit 1; }
           grep -q 'in 1,234 / out 567 tokens' "$mock/ok.out" || { echo "::error::responses usage did not reach the footer"; cat "$mock/ok.out"; exit 1; }
           grep -q 'est. \$' "$mock/ok.out" || { echo "::error::responses usage did not produce a cost estimate"; exit 1; }
-          grep -q 'ignored repeat' "$mock/ok.out" && { echo "::error::output_text.done was appended to the deltas"; exit 1; }
+          if grep -q 'ignored repeat' "$mock/ok.out"; then echo "::error::output_text.done was appended to the deltas"; exit 1; fi
           echo "::endgroup::"
 
-          echo "::group::responses request shape"
+          echo "::group::responses, the first terminal event ends the read"
+          run_mock responses mock-junk "$mock/junk.out" || { echo "::error::a line after response.completed was read"; cat "$mock/junk.out"; exit 1; }
+          grep -q 'MOCKJUNKTEXT' "$mock/junk.out" || { echo "::error::junk-scenario text missing from the digest"; exit 1; }
+          [ "$(requests_for mock-junk)" = 1 ] || { echo "::error::a clean completion was retried"; exit 1; }
+          echo "::endgroup::"
+
+          echo "::group::responses, partial usage is no usage"
+          run_mock responses mock-partial-usage "$mock/partial.out" || { cat "$mock/partial.out"; exit 1; }
+          grep -q 'token usage not reported by the endpoint' "$mock/partial.out" || { echo "::error::partial usage was reported as usage"; cat "$mock/partial.out"; exit 1; }
+          if grep -q 'NaN' "$mock/partial.out"; then echo "::error::partial usage produced NaN"; exit 1; fi
+          echo "::endgroup::"
+
+          echo "::group::request shapes"
           python3 - "$mock/requests.jsonl" <<'PY'
           import json, sys
           reqs = [json.loads(l) for l in open(sys.argv[1])]
-          r = reqs[-1]
+          r = next(q for q in reqs if q["path"] == "/v1/responses" and q["body"].get("model") == "mock-ok")
           b = r["body"]
           problems = []
-          if r["path"] != "/v1/responses": problems.append(f"path {r['path']}")
           if r["auth"] != "Bearer mock-key": problems.append("authorization header")
+          want = ["input", "instructions", "max_output_tokens", "model", "reasoning", "store", "stream"]
+          if sorted(b) != want: problems.append(f"keys {sorted(b)}, want {want}")
           if b.get("reasoning") != {"effort": "max"}: problems.append(f"reasoning {b.get('reasoning')}")
           if b.get("store") is not False: problems.append("store must be false")
           if b.get("stream") is not True: problems.append("stream must be true")
           if b.get("max_output_tokens") != 128000: problems.append(f"max_output_tokens {b.get('max_output_tokens')}")
-          if not b.get("instructions") or not isinstance(b.get("input"), str) or not b["input"]: problems.append("instructions/input")
-          for k in ("messages", "reasoning_effort", "max_completion_tokens", "stream_options"):
-              if k in b: problems.append(f"chat-only field {k} sent to responses")
+          if not isinstance(b.get("instructions"), str) or not b["instructions"]: problems.append("instructions")
+          if not isinstance(b.get("input"), str) or not b["input"]: problems.append("input")
           if problems:
               print("::error::responses request shape: " + "; ".join(problems)); sys.exit(1)
           print("responses request shape ok")
@@ -694,23 +750,43 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::responses, failure paths"
-          expect_fail "an incomplete response for any other reason" 'incomplete:content_filter' responses mock-filter "$mock/filter.out"
-          expect_fail "response.failed" 'MOCKFAILURE' responses mock-failed "$mock/failed.out"
-          expect_fail "an HTTP 400" 'model API error 400' responses mock-400 "$mock/400.out"
+          expect_fail "the ceiling reached before any text" 'raise delta_max_completion_tokens' '' responses mock-trunc-empty "$mock/trunc-empty.out"
+          expect_fail "an incomplete response for any other reason" 'incomplete:content_filter' MOCKLEAKFILTER responses mock-filter "$mock/filter.out"
+          expect_fail "response.failed after some text" 'MOCKFAILURE' MOCKLEAKFAILED responses mock-failed "$mock/failed.out"
+          expect_fail "an error event" 'MOCKERRFLAT' MOCKLEAKERROR responses mock-error "$mock/error.out"
+          expect_fail "an error event, nested shape" 'MOCKERRNESTED' MOCKLEAKNESTED responses mock-error-nested "$mock/error-nested.out"
+          expect_fail "an error, then completed" 'MOCKERRFIRST' MOCKLEAKLATE responses mock-error-then-completed "$mock/error-late.out"
+          expect_fail "a stream with no terminal event" 'finish_reason=null' MOCKLEAKNOTERM responses mock-noterm "$mock/noterm.out"
+          expect_fail "an HTTP 400" 'model API error 400' '' responses mock-400 "$mock/400.out"
           echo "::endgroup::"
 
           echo "::group::default path is still chat"
           run_mock '' mock-ok "$mock/chat.out" || { cat "$mock/chat.out"; exit 1; }
           grep -q 'MOCKCHATTEXT' "$mock/chat.out" || { echo "::error::chat text missing from the digest"; exit 1; }
-          grep -q 'in 1,234 / out 567 tokens' "$mock/chat.out" || { echo "::error::chat usage did not reach the footer"; exit 1; }
+          grep -q 'in 1,234 / out 567 tokens' "$mock/chat.out" || { echo "::error::chat usage did not reach the footer"; cat "$mock/chat.out"; exit 1; }
           python3 - "$mock/requests.jsonl" <<'PY'
           import json, sys
-          r = [json.loads(l) for l in open(sys.argv[1])][-1]
-          b = r["body"]
-          ok = r["path"] == "/v1/chat/completions" and b.get("reasoning_effort") == "max" and isinstance(b.get("messages"), list) and "input" not in b
-          if not ok:
-              print(f"::error::an unset DIGEST_API must keep the chat request shape, got {r['path']} {sorted(b)}"); sys.exit(1)
-          print("default chat request shape ok")
+          reqs = [json.loads(l) for l in open(sys.argv[1])]
+          c = next(q for q in reqs if q["path"] == "/v1/chat/completions" and q["body"].get("model") == "mock-ok")
+          r = next(q for q in reqs if q["path"] == "/v1/responses" and q["body"].get("model") == "mock-ok")
+          b = c["body"]
+          problems = []
+          want = ["max_completion_tokens", "messages", "model", "reasoning_effort", "stream", "stream_options"]
+          if sorted(b) != want: problems.append(f"keys {sorted(b)}, want {want}")
+          if b.get("reasoning_effort") != "max": problems.append(f"reasoning_effort {b.get('reasoning_effort')}")
+          if b.get("max_completion_tokens") != 128000: problems.append(f"max_completion_tokens {b.get('max_completion_tokens')}")
+          if b.get("stream") is not True: problems.append("stream must be true")
+          if b.get("stream_options") != {"include_usage": True}: problems.append(f"stream_options {b.get('stream_options')}")
+          m = b.get("messages") or []
+          if [x.get("role") for x in m] != ["system", "user"]: problems.append(f"roles {[x.get('role') for x in m]}")
+          # Same review either way: only the envelope differs between the endpoints.
+          elif m[0].get("content") != r["body"].get("instructions") or m[1].get("content") != r["body"].get("input"):
+              problems.append("chat messages and responses instructions/input carry different text")
+          if problems:
+              print("::error::an unset DIGEST_API must keep the chat request shape: " + "; ".join(problems)); sys.exit(1)
+          print("default chat request shape ok, same prompt as the responses path")
           PY
+          expect_fail "chat, the ceiling reached before any text" 'raise delta_max_completion_tokens' '' '' mock-trunc-empty "$mock/chat-trunc-empty.out"
+          expect_fail "chat, a stream with no terminal event" 'finish_reason=null' MOCKLEAKCHATNOTERM '' mock-noterm "$mock/chat-noterm.out"
           echo "::endgroup::"
           echo "both endpoint paths pass against the mock, including every fail-closed case"

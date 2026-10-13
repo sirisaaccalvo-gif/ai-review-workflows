@@ -170,9 +170,16 @@ accepts `reasoning.effort: "max"` on the Responses API. The Responses stream als
 kept sending events at least every 7 seconds through an 8 minute `max` run, so a
 long think does not go silent. Usage, truncation and failures land on the same
 paths as `chat`: the footer and cost estimate read the same token counts, a
-response cut short at `max_output_tokens` posts with the truncation banner, and
-any other incomplete, failed or errored response fails closed with the cursor
-unchanged.
+response cut short at `max_output_tokens` after writing review text posts with
+the truncation banner, and any other incomplete, failed or errored response
+fails closed with the cursor unchanged, even if it streamed some text first.
+The first terminal event decides the outcome; anything after it is ignored.
+
+`max` needs a larger output ceiling than the `32768` delta default, because
+reasoning tokens count against `max_output_tokens` too. A response that spends
+the whole ceiling reasoning, before any visible text, fails with a message
+naming `*_max_completion_tokens` rather than posting an empty digest. Set it
+alongside the effort, as the example stub shows (`'128000'`).
 
 ---
 

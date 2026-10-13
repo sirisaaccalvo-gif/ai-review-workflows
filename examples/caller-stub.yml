@@ -73,6 +73,8 @@ jobs:
       #   delta_provider: moonshot     # flip delta to the other family
       #   delta_model: kimi-k3
       #   delta_model_label: Kimi K3
+      #   delta_api: responses         # Responses API, e.g. for a model that
+      #   delta_effort: max            # accepts effort max only there
       #   docs_paths: 'docs/'          # narrow the prose paths for this repo
       #   prompt_extra: 'This codebase has runtime attack surface: weight the
       #     review toward prompt-injection paths, secret and credential

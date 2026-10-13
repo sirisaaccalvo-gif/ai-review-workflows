@@ -79,6 +79,7 @@ jobs:
                 GITHUB_ENV="$RUNNER_TEMP/env.txt" GITHUB_OUTPUT="$RUNNER_TEMP/out.txt" \
                 GITHUB_REPOSITORY=owner/caller \
                 IN_CENTRAL_REF="${1-$SHA}" IN_CENTRAL_REPO="${2-}" IN_MODE="${3-}" IN_NODE_VERSION="${4-}" \
+                IN_DELTA_API="${5-}" IN_DELTA_PROVIDER="${6-}" \
                 bash --noprofile --norc -euo pipefail "$RUNNER_TEMP/resolve.sh"
           }
 
@@ -88,6 +89,13 @@ jobs:
           grep -q "^central_ref=$SHA$" "$RUNNER_TEMP/out.txt"
           grep -q '^key_env=OPENAI_API_KEY$' "$RUNNER_TEMP/out.txt"
           grep -q '^node_version=24$' "$RUNNER_TEMP/out.txt"
+          grep -A1 '^DIGEST_API<<' "$RUNNER_TEMP/env.txt" | grep -qx 'chat'
+          echo "::endgroup::"
+
+          echo "::group::opt-in Responses API"
+          run_resolve "$SHA" "" "" "" responses
+          grep -A1 '^DIGEST_API<<' "$RUNNER_TEMP/env.txt" | grep -qx 'responses'
+          grep -A1 '^DIGEST_API_BASE<<' "$RUNNER_TEMP/env.txt" | grep -qx 'https://api.openai.com/v1'
           echo "::endgroup::"
 
           # Each of these MUST fail. `run_resolve ... && exit 1` would be
@@ -108,6 +116,8 @@ jobs:
           must_reject "a multiline central_repo"            "$SHA" "$(printf 'owner/repo\nkey_env=MOONSHOT_API_KEY')"
           must_reject "an unknown mode"                     "$SHA" "" "sideways"
           must_reject "a bogus node_version"                "$SHA" "" "" "24; rm -rf /"
+          must_reject "an unknown api"                      "$SHA" "" "" "" "graphql"
+          must_reject "responses on a non-openai provider"  "$SHA" "" "" "" "responses" "moonshot"
 
           # The injection attempt must not have reached the outputs.
           run_resolve "$SHA" >/dev/null 2>&1
@@ -119,7 +129,7 @@ jobs:
           # silent: a `full` caller would quietly get a delta run.
           run_resolve >/dev/null 2>&1
           for v in DIGEST_MODE DIGEST_MODEL_LABEL DIGEST_API_BASE DIGEST_KEY_ENV DIGEST_MODEL \
-                   DIGEST_MAX_COMPLETION_TOKENS DIGEST_ISSUE_TITLE DIGEST_DOCS_PATHS \
+                   DIGEST_MAX_COMPLETION_TOKENS DIGEST_API DIGEST_ISSUE_TITLE DIGEST_DOCS_PATHS \
                    DIGEST_BINARY_EXTENSIONS DIGEST_PRICING DIGEST_CENTRAL_REF; do
             grep -q "^$v<<" "$RUNNER_TEMP/env.txt" || { echo "::error::Resolve no longer writes $v"; exit 1; }
           done
@@ -534,3 +544,173 @@ jobs:
           echo "meta-test passed: the state assertion fails when the fix is reverted"
 
           echo "end-to-end dry run passed"
+
+      - name: Both endpoint paths against a local mock provider
+        # The stub runs above never reach the network code, so the request
+        # bodies and both stream parsers were untested. This runs the real
+        # script, real fetch and real TLS against a local server that replays
+        # canned Chat Completions and Responses streams: clean completion,
+        # truncation, every fail-closed terminal, and an HTTP 400. It also pins
+        # that an unset DIGEST_API keeps the chat request shape, since every
+        # existing caller depends on that default. Reuses the fixture repo the
+        # previous step built.
+        run: |
+          set -euo pipefail
+          # Both endpoint paths against a local mock of the provider. No network, no key.
+          # TLS is real: the script only accepts an https base, so the mock serves a
+          # throwaway self-signed certificate that NODE_EXTRA_CA_CERTS trusts for these
+          # runs only.
+          mock="$RUNNER_TEMP/mock"
+          mkdir -p "$mock"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=127.0.0.1' \
+            -addext 'subjectAltName=IP:127.0.0.1' \
+            -keyout "$mock/key.pem" -out "$mock/cert.pem" 2>/dev/null
+
+          cat > "$mock/server.mjs" <<'JS'
+          import https from 'node:https'
+          import fs from 'node:fs'
+          const dir = process.argv[2]
+          const sse = (o) => `data: ${JSON.stringify(o)}\n\n`
+          const usage = { input_tokens: 1234, output_tokens: 567, output_tokens_details: { reasoning_tokens: 500 } }
+          // One scenario per model id, so a single server covers every case.
+          const responses = {
+            'mock-ok': [
+              { type: 'response.created', response: { status: 'in_progress' } },
+              { type: 'keepalive' },
+              { type: 'response.output_item.added', item: { type: 'reasoning' } },
+              { type: 'response.output_text.delta', delta: '1 finding, worst severity: Low\n' },
+              { type: 'response.output_text.delta', delta: '- [ ] **Low - a.mjs**: MOCKRESPONSESTEXT\n' },
+              { type: 'response.output_text.done', text: 'ignored repeat of the deltas' },
+              { type: 'response.completed', response: { status: 'completed', usage } },
+            ],
+            'mock-trunc': [
+              { type: 'response.output_text.delta', delta: '1 finding, worst severity: Low\n- [ ] **Low - a.mjs**: cut sho' },
+              { type: 'response.incomplete', response: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, usage } },
+            ],
+            'mock-filter': [
+              { type: 'response.output_text.delta', delta: 'partial text' },
+              { type: 'response.incomplete', response: { status: 'incomplete', incomplete_details: { reason: 'content_filter' }, usage } },
+            ],
+            'mock-failed': [
+              { type: 'response.failed', response: { status: 'failed', error: { code: 'server_error', message: 'MOCKFAILURE' } } },
+            ],
+          }
+          https.createServer({ key: fs.readFileSync(`${dir}/key.pem`), cert: fs.readFileSync(`${dir}/cert.pem`) }, (req, res) => {
+            let raw = ''
+            req.on('data', (c) => { raw += c })
+            req.on('end', () => {
+              let body = {}
+              try { body = JSON.parse(raw) } catch {}
+              fs.appendFileSync(`${dir}/requests.jsonl`, JSON.stringify({ path: req.url, auth: req.headers.authorization, body }) + '\n')
+              if (body.model === 'mock-400') {
+                res.writeHead(400, { 'content-type': 'application/json' })
+                return res.end('{"error":{"message":"MOCK400 unsupported value"}}')
+              }
+              res.writeHead(200, { 'content-type': 'text/event-stream' })
+              let text
+              if (req.url === '/v1/responses') {
+                text = (responses[body.model] ?? []).map(sse).join('')
+              } else {
+                text = [
+                  { choices: [{ delta: { content: '1 finding, worst severity: Low\n- [ ] **Low - a.mjs**: MOCKCHATTEXT\n' } }] },
+                  { choices: [{ delta: {}, finish_reason: 'stop' }] },
+                  { choices: [], usage: { prompt_tokens: 1234, completion_tokens: 567 } },
+                ].map(sse).join('') + 'data: [DONE]\n\n'
+              }
+              // Uneven writes that split JSON lines mid-object, to exercise the
+              // line buffer across read boundaries.
+              let i = 0
+              const step = () => {
+                if (i >= text.length) return res.end()
+                res.write(text.slice(i, i + 37)); i += 37
+                setImmediate(step)
+              }
+              step()
+            })
+          }).listen(0, '127.0.0.1', function () {
+            fs.writeFileSync(`${dir}/port`, String(this.address().port))
+          })
+          JS
+
+          rm -f "$mock/port" "$mock/requests.jsonl"
+          node "$mock/server.mjs" "$mock" &
+          mock_pid=$!
+          trap 'kill $mock_pid 2>/dev/null || true' EXIT
+          for _ in $(seq 50); do [ -s "$mock/port" ] && break; sleep 0.1; done
+          [ -s "$mock/port" ] || { echo "::error::mock server did not start"; exit 1; }
+          port="$(cat "$mock/port")"
+
+          run_mock() {
+            # $1 = api ('' for the default), $2 = model, $3 = output file
+            env -u DIGEST_STUB \
+              NODE_EXTRA_CA_CERTS="$mock/cert.pem" \
+              DIGEST_CALLER_DIR="$RUNNER_TEMP/fixture" DIGEST_DEFAULT_BRANCH=main DIGEST_POST=false DIGEST_MODE=delta \
+              DIGEST_MODEL_LABEL='CI mock' DIGEST_API_BASE="https://127.0.0.1:$port/v1" \
+              DIGEST_KEY_ENV=OPENAI_API_KEY DIGEST_API_KEY=mock-key DIGEST_MODEL="$2" DIGEST_EFFORT=max \
+              DIGEST_MAX_COMPLETION_TOKENS=128000 DIGEST_API="$1" \
+              DIGEST_PRICING="{\"$2\":{\"in\":1,\"out\":1}}" \
+              node scripts/ai-weekly-digest.mjs > "$3" 2>&1
+          }
+          expect_fail() {
+            local label="$1" needle="$2"; shift 2
+            if run_mock "$@"; then echo "::error::$label exited 0; it must fail closed"; exit 1; fi
+            grep -qF "$needle" "$3" || { echo "::error::$label failed without '$needle'"; cat "$3"; exit 1; }
+            echo "  failed closed as required: $label"
+          }
+
+          echo "::group::responses, clean completion"
+          run_mock responses mock-ok "$mock/ok.out" || { cat "$mock/ok.out"; exit 1; }
+          grep -q 'MOCKRESPONSESTEXT' "$mock/ok.out" || { echo "::error::responses text missing from the digest"; exit 1; }
+          grep -q 'in 1,234 / out 567 tokens' "$mock/ok.out" || { echo "::error::responses usage did not reach the footer"; cat "$mock/ok.out"; exit 1; }
+          grep -q 'est. \$' "$mock/ok.out" || { echo "::error::responses usage did not produce a cost estimate"; exit 1; }
+          grep -q 'ignored repeat' "$mock/ok.out" && { echo "::error::output_text.done was appended to the deltas"; exit 1; }
+          echo "::endgroup::"
+
+          echo "::group::responses request shape"
+          python3 - "$mock/requests.jsonl" <<'PY'
+          import json, sys
+          reqs = [json.loads(l) for l in open(sys.argv[1])]
+          r = reqs[-1]
+          b = r["body"]
+          problems = []
+          if r["path"] != "/v1/responses": problems.append(f"path {r['path']}")
+          if r["auth"] != "Bearer mock-key": problems.append("authorization header")
+          if b.get("reasoning") != {"effort": "max"}: problems.append(f"reasoning {b.get('reasoning')}")
+          if b.get("store") is not False: problems.append("store must be false")
+          if b.get("stream") is not True: problems.append("stream must be true")
+          if b.get("max_output_tokens") != 128000: problems.append(f"max_output_tokens {b.get('max_output_tokens')}")
+          if not b.get("instructions") or not isinstance(b.get("input"), str) or not b["input"]: problems.append("instructions/input")
+          for k in ("messages", "reasoning_effort", "max_completion_tokens", "stream_options"):
+              if k in b: problems.append(f"chat-only field {k} sent to responses")
+          if problems:
+              print("::error::responses request shape: " + "; ".join(problems)); sys.exit(1)
+          print("responses request shape ok")
+          PY
+          echo "::endgroup::"
+
+          echo "::group::responses, truncated at max_output_tokens"
+          run_mock responses mock-trunc "$mock/trunc.out" || { cat "$mock/trunc.out"; exit 1; }
+          grep -q 'output-token ceiling' "$mock/trunc.out" || { echo "::error::max_output_tokens did not take the disclosed-truncation path"; cat "$mock/trunc.out"; exit 1; }
+          echo "::endgroup::"
+
+          echo "::group::responses, failure paths"
+          expect_fail "an incomplete response for any other reason" 'incomplete:content_filter' responses mock-filter "$mock/filter.out"
+          expect_fail "response.failed" 'MOCKFAILURE' responses mock-failed "$mock/failed.out"
+          expect_fail "an HTTP 400" 'model API error 400' responses mock-400 "$mock/400.out"
+          echo "::endgroup::"
+
+          echo "::group::default path is still chat"
+          run_mock '' mock-ok "$mock/chat.out" || { cat "$mock/chat.out"; exit 1; }
+          grep -q 'MOCKCHATTEXT' "$mock/chat.out" || { echo "::error::chat text missing from the digest"; exit 1; }
+          grep -q 'in 1,234 / out 567 tokens' "$mock/chat.out" || { echo "::error::chat usage did not reach the footer"; exit 1; }
+          python3 - "$mock/requests.jsonl" <<'PY'
+          import json, sys
+          r = [json.loads(l) for l in open(sys.argv[1])][-1]
+          b = r["body"]
+          ok = r["path"] == "/v1/chat/completions" and b.get("reasoning_effort") == "max" and isinstance(b.get("messages"), list) and "input" not in b
+          if not ok:
+              print(f"::error::an unset DIGEST_API must keep the chat request shape, got {r['path']} {sorted(b)}"); sys.exit(1)
+          print("default chat request shape ok")
+          PY
+          echo "::endgroup::"
+          echo "both endpoint paths pass against the mock, including every fail-closed case"

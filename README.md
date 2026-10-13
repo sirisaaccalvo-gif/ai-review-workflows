@@ -123,11 +123,13 @@ configuration` step of [`ai-digest.yml`](.github/workflows/ai-digest.yml).
 | `delta_model` | `gpt-5.6-terra` | |
 | `delta_effort` | `high` | empty omits `reasoning_effort` |
 | `delta_max_completion_tokens` | `32768` | |
+| `delta_api` | `chat` | `chat` (Chat Completions) or `responses` (Responses API, `openai` provider only); see below |
 | `full_model_label` | `Kimi K3 (max reasoning)` | |
 | `full_provider` | `moonshot` | |
 | `full_model` | `kimi-k3` | |
 | `full_effort` | *(empty)* | K3's API default already is max effort |
 | `full_max_completion_tokens` | `131072` | |
+| `full_api` | `chat` | as `delta_api`, for full mode |
 | `issue_title` | `🤖 AI weekly code digest (automated)` | **see the warning below** |
 | `assignee` | repository owner | best effort; a failed assignment warns, never fails the digest |
 | `docs_paths` | `docs/,.planning/` | prose prefixes gated behind `include_docs` |
@@ -152,6 +154,25 @@ There is deliberately **no base-URL input**. `*_provider` is a closed enum that
 selects a hardcoded endpoint together with the matching secret. A free-form URL
 would let anyone who can edit a caller stub redirect a live API key to a host of
 their choosing, and the digest output would look entirely normal while doing it.
+
+### `delta_api` / `full_api`: Chat Completions or the Responses API
+
+`chat`, the default, is the only path older pins have. `responses` sends the same
+review to OpenAI's Responses API instead: the system prompt becomes
+`instructions`, the effort becomes `reasoning.effort`, the output ceiling becomes
+`max_output_tokens`, and `store: false` keeps the reviewed diff out of stored
+responses. It is a closed enum like `*_provider`, and `responses` is refused with
+any provider but `openai`.
+
+Pick `responses` when a setting exists only there. Measured 2026-10-13:
+`gpt-6-luna` rejects `reasoning_effort: "max"` on Chat Completions with a 400 but
+accepts `reasoning.effort: "max"` on the Responses API. The Responses stream also
+kept sending events at least every 7 seconds through an 8 minute `max` run, so a
+long think does not go silent. Usage, truncation and failures land on the same
+paths as `chat`: the footer and cost estimate read the same token counts, a
+response cut short at `max_output_tokens` posts with the truncation banner, and
+any other incomplete, failed or errored response fails closed with the cursor
+unchanged.
 
 ---
 

@@ -151,6 +151,27 @@ const ASSIGNEE = str('DIGEST_ASSIGNEE', OWNER)
 // because repos disagree about which directories hold prose, and not every repo
 // has all of them.
 const DOCS_PATHS = str('DIGEST_DOCS_PATHS', 'docs/,.planning/').split(',').map((s) => s.trim()).filter(Boolean)
+// Paths whose CONTENTS this repository's digest never sends, in either mode:
+// raw research output, hand-made previews, or files a repo has decided must
+// not leave it. Comma separated git glob pathspecs (`**` crosses directories).
+// Checked before anything runs, because a bad entry either crashes every run
+// (git rejects an absolute or `..` path as outside the repository, so every
+// cron fails) or quietly empties the review (`**`) while the cursor advances.
+const EXCLUDE_PATHS = str('DIGEST_EXCLUDE_PATHS', '').split(',').map((s) => s.trim()).filter(Boolean)
+for (const p of EXCLUDE_PATHS) {
+  const bad = /[\x00-\x1f\x7f]/.test(p) ? 'contains a control character'
+    : p.includes('\\') ? 'contains a backslash (git paths use forward slashes)'
+    : p.startsWith('/') ? 'is an absolute path'
+    : p.startsWith(':') ? 'starts with git pathspec magic'
+    : /^\.(\/|$)/.test(p) ? 'starts with "./" (write it from the repository root)'
+    : p.split('/').includes('..') ? 'points outside the repository'
+    : /^[*/]+$/.test(p) ? 'would exclude every file'
+    : null
+  if (bad) fail(`exclude_paths entry "${p.slice(0, 120)}" ${bad}; refusing to run (nothing was sent)`)
+}
+// The delta diff has always dropped lockfiles by pathspec; the same globs name
+// them in the not-shown list below, so the two can never disagree.
+const LOCKFILE_GLOBS = ['*package-lock.json', '*.lock', '*pnpm-lock.yaml', '*bun.lockb', '*go.sum']
 // Regex alternation body, not a plain list: the defaults need `jpe?g` and
 // `woff2?`. Callers extend it: a repo whose svg files are exported vector art
 // rather than hand-written markup will want to add `svg`, since a single
@@ -347,7 +368,52 @@ const carried = readCarried(previousComments)
 
 // ── build the review input ──────────────────────────────────────────────────
 const notes = [] // disclosure lines that go in the digest header
-let inputText = ''
+// The review input is a preamble (commit list, files not shown, heading) and a
+// review body (diff sections or file sections). Only the body is split when a run is
+// chunked; every chunk repeats the preamble, so no chunk reviews code without
+// the commit list or the list of files deliberately left out.
+let preamble = ''
+let reviewBody = ''
+// Changed or tracked files whose contents are not sent, with the reason, for
+// the not-shown section. Names only, never contents.
+const notShown = []
+const notShownSection = (title, lead) => {
+  if (!notShown.length) return ''
+  const CAP = 300
+  // Names are repository data: escape control characters and backticks so a
+  // crafted file name cannot break out of its list item and add lines.
+  const show = (f) => JSON.stringify(f).slice(1, -1).replace(/`/g, '\\`')
+  const lines = notShown.slice(0, CAP).map(([f, why]) => `- \`${show(f)}\` (${why})`)
+  if (notShown.length > CAP) lines.push(`- and ${notShown.length - CAP} more`)
+  return `## ${title}\n${lead}\n${lines.join('\n')}\n\n`
+}
+// Tracked files matched by exclude_paths, and how many each entry matched.
+// An entry that matches nothing is almost always a typo or a wrong-case path,
+// and a typo would send exactly what it was meant to hold back, so the run
+// refuses to start (see unmatched() below) instead of warning and sending.
+const excludedTracked = new Set()
+const trackedHits = new Map()
+const lsGlob = async (p) => (await git('ls-files', '-z', '--', `:(glob)${p}`)).split('\0').filter(Boolean)
+for (const p of EXCLUDE_PATHS) {
+  const hits = await lsGlob(p)
+  trackedHits.set(p, hits.length)
+  for (const h of hits) excludedTracked.add(h)
+  // Under glob magic `*` never crosses `/`, so `dir/*` covers only the top of
+  // a folder. Someone used to .gitignore expects the whole tree, and the
+  // nested files would be sent while the entry still "matches".
+  if (p.endsWith('/*') && (await lsGlob(`${p}*`)).length > hits.length) {
+    fail(`exclude_paths entry "${p}" covers only the top level of a folder that has subfolders, which would still be sent; write "${p}*" to cover them. Nothing was sent.`)
+  }
+}
+// An entry that matched files earlier in history but none now is not a typo:
+// the files were deleted or moved. Keeping the entry after a deletion is the
+// safe order (removing it in the same change would send the deleted contents),
+// so it must not stop later runs.
+const everMatched = async (p) => Boolean((await git('log', '-1', '--format=%H', 'HEAD', '--', `:(glob)${p}`)).trim())
+const unmatched = async (p, where) => {
+  if (await everMatched(p)) return
+  fail(`exclude_paths entry "${p}" matches no ${where}, now or earlier in history; fix it (a typo would send what it was meant to hold back) or remove it. Nothing was sent.`)
+}
 let rangeLabel = ''
 let base = null
 
@@ -391,8 +457,50 @@ if (MODE === 'delta') {
   }
   const log = (await git('log', '--oneline', '--no-decorate', `${base}..${head}`)).trim()
   const commitCount = log ? log.split('\n').length : 0
-  const rawDiff = await git('diff', `${base}..${head}`, '--', '.',
-    ':(exclude)*package-lock.json', ':(exclude)*.lock', ':(exclude)*pnpm-lock.yaml', ':(exclude)*bun.lockb', ':(exclude)*go.sum')
+  // --no-renames so both sides of a rename count: a path deleted or renamed
+  // away in this range still matches.
+  const changedMatching = async (specs, ...flags) => specs.length
+    ? (await git('diff', '--name-only', ...flags, '-z', `${base}..${head}`, '--', ...specs)).split('\0').filter(Boolean)
+    : []
+  const byRepo = new Set()
+  for (const p of EXCLUDE_PATHS) {
+    const inRange = await changedMatching([`:(glob)${p}`], '--no-renames')
+    if (!trackedHits.get(p) && !inRange.length) await unmatched(p, 'tracked file and no file changed in this range')
+    for (const f of inRange) byRepo.add(f)
+  }
+  // Pathspecs filter BEFORE rename detection, so a rename across the boundary
+  // would show the far side in full: moving a file INTO an excluded folder
+  // shows its old contents as deleted lines, and moving one out shows it as
+  // added. Both sides of any rename that touches an excluded path are left out.
+  const pairedAway = []
+  if (byRepo.size) {
+    const recs = (await git('diff', '-M', '--name-status', '-z', `${base}..${head}`)).split('\0')
+    for (let i = 0; i < recs.length;) {
+      const st = recs[i]
+      if (!st) { i++; continue }
+      if (st[0] === 'R' || st[0] === 'C') {
+        const [from, to] = [recs[i + 1], recs[i + 2]]
+        i += 3
+        if (byRepo.has(from) && !byRepo.has(to)) pairedAway.push(to)
+        if (byRepo.has(to) && !byRepo.has(from)) pairedAway.push(from)
+      } else {
+        i += 2
+      }
+    }
+  }
+  // A name that is not valid UTF-8 arrives here with U+FFFD in it and cannot
+  // be passed back to git as a literal pathspec, so its side of the move would
+  // be sent. Refuse rather than guess.
+  const unencodable = pairedAway.find((f) => f.includes('\uFFFD'))
+  if (unencodable) fail(`a file renamed to or from an excluded path has a name that is not valid UTF-8 ("${unencodable.slice(0, 120)}"), so it cannot be held back precisely; rename it or exclude it explicitly. Nothing was sent.`)
+  // With exclusions set, deleted files show only their header. A move into an
+  // excluded folder that git does not pair as a rename (heavily edited, under
+  // its 50% similarity cut-off) otherwise shows the old contents as deleted
+  // lines.
+  const rawDiff = await git('diff', ...(EXCLUDE_PATHS.length ? ['--irreversible-delete'] : []), `${base}..${head}`, '--', '.',
+    ...LOCKFILE_GLOBS.map((g) => `:(exclude)${g}`),
+    ...EXCLUDE_PATHS.map((p) => `:(exclude,glob)${p}`),
+    ...pairedAway.map((f) => `:(exclude,literal)${f}`))
   // Git prints a TEXT diff for any file its NUL-byte heuristic does not flag as
   // binary, and a PDF built from HTML passes that heuristic. One such PDF put
   // 2.4 million characters of stream data into a delta diff; the chars/4
@@ -419,8 +527,49 @@ if (MODE === 'delta') {
     const shown = excluded.slice(0, 5).map((f) => `\`${f}\``).join(', ')
     notes.push(`ℹ️ excluded ${excluded.length} changed file(s) with a binary extension from the diff: ${shown}${excluded.length > 5 ? `, and ${excluded.length - 5} more` : ''}`)
   }
+  // Name every changed file whose contents are left out, so the model does not
+  // report a lockfile or an excluded file as missing (a package.json change
+  // with no visible lockfile change has already produced a false High). Asked
+  // of git with the same pathspecs the diff used, so the list and the diff
+  // cannot disagree about which files matched.
+  const listed = new Set()
+  const add = (f, why) => { if (!listed.has(f)) { listed.add(f); notShown.push([f, why]) } }
+  for (const f of byRepo) add(f, "excluded by this repository's exclude_paths")
+  for (const f of pairedAway) add(f, 'renamed to or from an excluded path')
+  for (const f of await changedMatching(LOCKFILE_GLOBS)) add(f, 'lockfile')
+  for (const f of excluded) add(f, 'binary extension')
+  const heldBack = byRepo.size + pairedAway.length
+  if (heldBack) notes.push(`ℹ️ ${heldBack} changed file(s) not sent because of this repository's \`exclude_paths\``)
+  // Nothing left to review: every change in range is excluded, a lockfile or a
+  // binary. A paid call would review a commit list and a list of names, and
+  // could only invent findings from them. Post a heartbeat instead. Like the
+  // quiet-period heartbeat it carries no marker, so the cursor stays where it
+  // is; the next run covers these commits again and skips the same files.
+  // It carries the delta marker, so the cursor moves past these commits the
+  // way a normal digest would: their files are never sent anyway. Without it a
+  // repository with no cursor yet would re-bootstrap every run, and a commit
+  // landing between two such runs could fall outside both windows. Heartbeats
+  // never carry the digest header, so carried findings are untouched.
+  if (!diff.trim()) {
+    const why = notShown.length
+      ? `changed only files this digest does not send (${notShown.length} file(s): excluded paths, lockfiles or binary files)`
+      : 'left no net change (the changes cancel out, or the commits change nothing)'
+    const heartbeat = [
+      `🫀 Nothing reviewable: ${commitCount} commit(s) on \`${defaultBranch}\` since \`${short(base)}\` ${why}. No model call (checked ${today}).`,
+      ...(notes.length ? ['', notes.map((n) => `> ${n}`).join('\n')] : []),
+      '',
+      `<!-- ai-digest mode=delta base=${base} head=${head} -->`,
+    ].join('\n')
+    await deliver(heartbeat, { heartbeat: true })
+    process.exit(0)
+  }
   rangeLabel = `\`${short(base)}..${short(head)}\`, ${commitCount} commits`
-  inputText = `## Commits in range\n${log}\n\n## Combined diff (lockfiles and binary extensions excluded)\n${diff}`
+  preamble = `## Commits in range\n${log}\n\n`
+    + notShownSection('Changed in range but not shown', 'These files changed in this range, but their contents are deliberately not included below. Do not report them as missing, and do not treat a change shown below as unmatched because its counterpart is in this list.')
+    + (EXCLUDE_PATHS.length
+      ? '## Combined diff (lockfiles and binary extensions excluded; deleted files show only their header)\n'
+      : '## Combined diff (lockfiles and binary extensions excluded)\n')
+  reviewBody = diff
 } else {
   // full: the tracked code corpus at HEAD. Code-only by default; the docs paths
   // are opt-in because they are prose and can dwarf the code.
@@ -438,6 +587,7 @@ if (MODE === 'delta') {
   //    below backstops it in case the working tree diverges from the index.
   // 2. CORRECTNESS. -z is NUL delimited, so paths containing newlines (legal in
   //    git) do not silently split into two bogus entries.
+  for (const p of EXCLUDE_PATHS) if (!trackedHits.get(p)) await unmatched(p, 'tracked file')
   const READABLE_MODES = new Set(['100644', '100755'])
   const skipped = { symlink: 0, submodule: 0 }
   const files = []
@@ -454,7 +604,10 @@ if (MODE === 'delta') {
       continue
     }
     if (BINARY.test(f) || LOCKFILES.has(path.basename(f)) || f.endsWith('.lock')) continue
-    if (DOCS_PATHS.some((p) => f.startsWith(p))) { if (INCLUDE_DOCS) files.push(f); continue }
+    if (DOCS_PATHS.some((p) => f.startsWith(p)) && !INCLUDE_DOCS) continue
+    // After the docs gate, so only files that would otherwise have been read
+    // are listed; include_docs never overrides this repository's exclusions.
+    if (excludedTracked.has(f)) { notShown.push([f, "excluded by this repository's exclude_paths"]); continue }
     files.push(f)
   }
   if (skipped.symlink) notes.push(`ℹ️ skipped ${skipped.symlink} tracked symlink(s); the corpus only includes regular files`)
@@ -481,7 +634,17 @@ if (MODE === 'delta') {
     }
     parts.push(`### File: ${f}\n\`\`\`\n${fs.readFileSync(real, 'utf8')}\n\`\`\``)
   }
-  inputText = parts.join('\n')
+  if (!parts.length) {
+    const heartbeat = [
+      `🫀 Nothing reviewable: a full scan of \`${short(worktreeHead)}\` found no file to read after this repository's settings (${notShown.length} held back by \`exclude_paths\`). No model call (checked ${today}).`,
+      ...(notes.length ? ['', notes.map((n) => `> ${n}`).join('\n')] : []),
+    ].join('\n')
+    await deliver(heartbeat, { heartbeat: true })
+    process.exit(0)
+  }
+  preamble = notShownSection('Tracked files not shown', "These tracked files are deliberately left out of this review by the repository's settings. Do not report them as missing.")
+  reviewBody = parts.join('\n')
+  if (notShown.length) notes.push(`ℹ️ ${notShown.length} tracked file(s) not sent because of this repository's \`exclude_paths\``)
   if (escaped) notes.push(`⚠️ ${escaped} tracked path(s) resolved outside the repository and were excluded; nothing outside \`${CALLER_DIR}\` is ever sent to the model`)
   if (dropped) notes.push(`ℹ️ skipped ${dropped} tracked path(s) that are not regular files in the working tree`)
   // parts.length, not files.length: the guards above can drop entries the index
@@ -495,6 +658,7 @@ if (MODE === 'delta') {
   }
 }
 
+const inputText = preamble + reviewBody
 const inputTokens = estTokens(inputText)
 if (inputTokens > WARN_INPUT_TOKENS) {
   // Context quality is the reason this line exists now that the long-context
@@ -517,24 +681,28 @@ if (inputTokens <= CHUNK_INPUT_TOKENS) {
   // would yield one oversized chunk sent anyway; and since a failed run never
   // advances the cursor, an over-ceiling period would then fail every cycle
   // until rescued.
-  const sections = MODE === 'full'
-    ? inputText.split(/(?=^### File: )/m)
-    : inputText.split(/(?=^diff --git )/m)
-  // A single section larger than the ceiling cannot be packed and would ship as
+  const sections = (MODE === 'full'
+    ? reviewBody.split(/(?=^### File: )/m)
+    : reviewBody.split(/(?=^diff --git )/m)).filter(Boolean)
+  // Every chunk carries the preamble, so the room left for code is the ceiling
+  // minus the preamble.
+  const room = CHUNK_INPUT_TOKENS - estTokens(preamble)
+  if (room <= 0) fail(`the commit list and not-shown list alone (~${num(estTokens(preamble))} tokens) exceed the ${num(CHUNK_INPUT_TOKENS)}-token chunk ceiling; raise chunk_input_tokens`)
+  // A single section larger than the room cannot be packed and would ship as
   // an unbounded request that fails every run without moving the cursor. Fail
   // loudly with the culprits named; the fix is a pathspec exclusion or a
   // deliberate ceiling bump.
-  const oversized = sections.filter((s) => estTokens(s) > CHUNK_INPUT_TOKENS)
+  const oversized = sections.filter((s) => estTokens(s) > room)
   if (oversized.length) {
     const names = oversized.map((s) => s.split('\n', 1)[0].slice(0, 120))
-    fail(`${oversized.length} single file section(s) exceed the ${num(CHUNK_INPUT_TOKENS)}-token chunk ceiling and cannot be packed: ${names.join(' | ')}`)
+    fail(`${oversized.length} single file section(s) exceed the ~${num(room)} tokens left per chunk (the ${num(CHUNK_INPUT_TOKENS)}-token ceiling minus ~${num(estTokens(preamble))} tokens of commit list and not-shown list, which every chunk repeats) and cannot be packed: ${names.join(' | ')}`)
   }
   let current = ''
   for (const s of sections) {
-    if (current && estTokens(current) + estTokens(s) > CHUNK_INPUT_TOKENS) { chunks.push(current); current = '' }
+    if (current && estTokens(current) + estTokens(s) > room) { chunks.push(preamble + current); current = '' }
     current += s
   }
-  if (current) chunks.push(current)
+  if (current) chunks.push(preamble + current)
   notes.push(`⚠️ input ~${num(inputTokens)} tokens exceeded the ${num(CHUNK_INPUT_TOKENS)} single-call ceiling; reviewed in ${chunks.length} file-boundary chunks (cross-chunk interactions not visible to the model)`)
 }
 
@@ -552,7 +720,7 @@ if (JOB_BUDGET_MS && chunks.length) {
   const perAttempt = Math.floor(Math.max(0, JOB_BUDGET_MS - RESERVE_MS) / (chunks.length * ATTEMPTS))
   if (perAttempt < CLIENT_TIMEOUT_MS) {
     if (perAttempt < FLOOR_MS) {
-      fail(`this run needs ${chunks.length} model call(s) and the job allows ${Math.round(JOB_BUDGET_MS / 60000)} minutes, which leaves ${Math.round(perAttempt / 1000)}s per attempt: below the ${FLOOR_MS / 1000}s floor. Raise job_timeout_minutes to at least ${Math.ceil((chunks.length * ATTEMPTS * FLOOR_MS + RESERVE_MS) / 60000)}, or lower chunk_input_tokens so fewer calls are needed. Refusing to start a run that cannot finish.`)
+      fail(`this run needs ${chunks.length} model call(s) and the job allows ${Math.round(JOB_BUDGET_MS / 60000)} minutes, which leaves ${Math.round(perAttempt / 1000)}s per attempt: below the ${FLOOR_MS / 1000}s floor. Raise chunk_input_tokens so fewer calls are needed, or raise this workflow's fixed job budget (timeout-minutes, DIGEST_JOB_BUDGET_MS and the preflight JOB_MS together) to at least ${Math.ceil((chunks.length * ATTEMPTS * FLOOR_MS + RESERVE_MS) / 60000)} minutes. Refusing to start a run that cannot finish.`)
     }
     console.log(`::warning::${chunks.length} chunks share a ${Math.round(JOB_BUDGET_MS / 60000)}-minute job budget; per-attempt timeout reduced from ${CLIENT_TIMEOUT_MS / 1000}s to ${Math.round(perAttempt / 1000)}s so the run fits`)
     CLIENT_TIMEOUT_MS = perAttempt

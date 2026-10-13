@@ -134,6 +134,7 @@ configuration` step of [`ai-digest.yml`](.github/workflows/ai-digest.yml).
 | `assignee` | repository owner | best effort; a failed assignment warns, never fails the digest |
 | `docs_paths` | `docs/,.planning/` | prose prefixes gated behind `include_docs` |
 | `binary_extensions` | images, fonts, archives, audio, video | regex alternation; skipped by full mode and dropped from delta diffs |
+| `exclude_paths` | *(empty)* | git glob patterns whose contents are never sent, in either mode; see below |
 | `prompt_extra` | *(empty)* | one or two sentences of repo-specific risk weighting |
 | `pricing` | Terra + K3 | JSON keyed by model id, for the cost footer |
 | `warn_input_tokens` | `250000` | |
@@ -181,6 +182,86 @@ the whole ceiling reasoning, before any visible text, fails with a message
 naming `*_max_completion_tokens` rather than posting an empty digest. Set it
 alongside the effort, as the example stub shows (`'128000'`).
 
+### `exclude_paths`: files whose contents never leave the repository
+
+A comma separated list of git glob patterns (`**` crosses directories),
+matched against paths from the repository root, case sensitively, for
+example `research/**,docs/previews/**/*.html`. In **both** modes this digest
+does not send the contents of matching files: delta drops them from the diff
+with a pathspec, and full mode skips them while walking the tree, even when
+`include_docs` is on. Typical uses are raw research output, hand-made
+preview pages, and files a repository has decided must not go to an outside
+model.
+
+- **Moves across the boundary are held back too.** Git filters pathspecs
+  before it detects renames, so a file moved INTO an excluded folder would
+  otherwise show its old contents as deleted lines, and one moved out would
+  show them as added.
+  - Both sides of any move git detects as a rename (by default at least 50%
+    similar) are left out of that range.
+  - While the setting is on, every deleted file shows only its header, so a
+    move in that git does not pair still shows nothing.
+  - A move OUT combined with heavy edits counts as a new file and is sent, the
+    same as a copy.
+  - A rename whose other side has a name that is not valid UTF-8 stops the run
+    rather than guess.
+- **Names are listed.** The delta review gets a "not shown" list naming every
+  changed file it left out and why: excluded by this setting, renamed to or
+  from an excluded path, a lockfile, or a binary extension. In full mode the
+  list names the tracked files this setting held back. The posted digest
+  header gives only the count.
+- **It fails closed.** An entry that matches nothing stops the run before
+  anything is sent, in either mode.
+  - "Nothing" means no tracked file, no file changed in the range (delta),
+    and no file anywhere in history.
+  - A typo or a wrong-case path would otherwise send exactly what it was meant
+    to hold back.
+  - `dir/*` is also refused when `dir` has subfolders: under glob rules `*`
+    never crosses `/`, so the nested files would still be sent. Write
+    `dir/**`.
+- **Bad entries are refused.** Malformed entries also stop the run before
+  anything is sent: a control character, a backslash, an absolute path, a
+  leading `./`, a `..` segment, a leading `:` (pathspec magic), or a pattern
+  made only of `*` and `/`.
+
+**Deleting or moving protected files: keep the entry.** Removing the entry in
+the same change that deletes or moves the files sends their contents in the
+next delta, as removed lines. Keep the entry until a digest has posted past
+that change. An entry that only matches history does not stop later runs, so
+it can stay.
+
+**What it does not cover.** It is a path filter for this digest, not a
+data-protection boundary for the repository:
+- **File names and commit subjects still go out.** The commit list and the
+  not-shown list carry them.
+- **Copies are not followed.** Content copied or pasted into a file outside
+  the patterns is sent like any other content.
+- **Earlier runs and other workflows are untouched.** It changes nothing about
+  what earlier runs already sent, or about any other workflow.
+- **It does not remove anything from git.** Contents that must not exist in the
+  repository at all need to be removed from it; this setting only stops this
+  digest from reading them.
+
+**Changes every caller gets on this version, with or without the setting:**
+- **Lockfiles and binaries are named.** The delta not-shown list names the
+  lockfiles and binary files a range changed. A model that sees `package.json`
+  change with no lockfile in the diff otherwise reports a missing lockfile
+  update.
+- **Chunks repeat the preamble.** Every chunk of a chunked run repeats the
+  commit list and the not-shown list, not just the first.
+- **Nothing reviewable means no model call.** When a range changed only
+  excluded files, lockfiles or binaries, or its changes cancel out, the digest
+  posts a heartbeat instead of paying a model to review an empty diff.
+  - Unlike the quiet-period heartbeat, it carries the delta marker, so the
+    cursor moves past those commits just as a normal digest would.
+  - It never carries the digest header, so carried findings are untouched.
+  - A full scan that finds nothing to read after the settings also posts a
+    heartbeat instead of calling the model.
+
+**Pinning order.** A caller that passes `exclude_paths` to a hub version that
+does not declare it fails when the workflow loads. Add the input in the same
+commit as the repin, and remove it before pinning back to an older hub SHA.
+
 ---
 
 ## How the state machine works
@@ -211,6 +292,8 @@ Loud fallbacks, never quiet ones:
   cron, so every scheduled run posts something.
 - Model or plumbing failure: exit 1, post nothing. A hollow digest would advance
   the cursor over an unreviewed range.
+- Commits in range, but nothing reviewable once excluded paths, lockfiles and
+  binaries are left out: a heartbeat **with** a marker and **no** API call.
 - `finish_reason=length`: posts **with** a truncation banner. Disclosed partial
   coverage beats silence.
 

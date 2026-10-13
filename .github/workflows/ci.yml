@@ -922,13 +922,23 @@ jobs:
           lacks "$x/f0.prompt" 'Tracked files not shown' "no full-mode section without the setting"
           echo "::endgroup::"
 
-          echo "::group::malformed entries fail before anything is sent"
-          for bad in '/etc/**' '../up/**' ':(top)src/**' '**' '*' '.' './**' 'secret\\**' "$(printf 'secret/**\tx')" 'src/**,**/*'; do
-            if run "$x/fx" delta "$bad" "$x/bad"; then echo "::error::exclude_paths '$bad' was accepted"; exit 1; fi
-            has "$x/bad.out" 'exclude_paths entry' "the rejection names the setting for '$bad'"
-            [ ! -s "$x/bad.prompt" ] || { echo "::error::a prompt was composed for '$bad'"; exit 1; }
-          done
-          echo "  rejected every malformed entry"
+          echo "::group::malformed entries fail before anything is sent, for the right reason"
+          reject() {
+            if run "$x/fx" delta "$1" "$x/bad"; then echo "::error::exclude_paths '$1' was accepted"; exit 1; fi
+            has "$x/bad.out" "$2" "the rejection reason for '$1'"
+            [ ! -s "$x/bad.prompt" ] || { echo "::error::a prompt was composed for '$1'"; exit 1; }
+          }
+          reject '/etc/**' 'is an absolute path'
+          reject '../up/**' 'points outside the repository'
+          reject ':(top)src/**' 'starts with git pathspec magic'
+          reject '**' 'would exclude every file'
+          reject '*' 'would exclude every file'
+          reject 'src/**,**/*' 'would exclude every file'
+          reject '.' 'starts with "./"'
+          reject './**' 'starts with "./"'
+          reject 'secret\**' 'contains a backslash'
+          reject "$(printf 'secret/**\tx')" 'contains a control character'
+          echo "  rejected every malformed entry with its own reason"
           echo "::endgroup::"
 
           echo "::group::an entry that matches nothing stops the run"

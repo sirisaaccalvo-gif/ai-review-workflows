@@ -196,21 +196,39 @@ model.
 - **Moves across the boundary are held back too.** Git filters pathspecs
   before it detects renames, so a file moved INTO an excluded folder would
   otherwise show its old contents as deleted lines, and one moved out would
-  show them as added. Both sides of any rename that touches an excluded path
-  are left out of that range. Deleted excluded files are left out as well.
+  show them as added.
+  - Both sides of any move git detects as a rename (by default at least 50%
+    similar) are left out of that range.
+  - While the setting is on, every deleted file shows only its header, so a
+    move in that git does not pair still shows nothing.
+  - A move OUT combined with heavy edits counts as a new file and is sent, the
+    same as a copy.
+  - A rename whose other side has a name that is not valid UTF-8 stops the run
+    rather than guess.
 - **Names are listed.** The delta review gets a "not shown" list naming every
   changed file it left out and why: excluded by this setting, renamed to or
   from an excluded path, a lockfile, or a binary extension. In full mode the
   list names the tracked files this setting held back. The posted digest
   header gives only the count.
 - **It fails closed.** An entry that matches nothing stops the run before
-  anything is sent, in either mode. "Nothing" means no tracked file, and in
-  delta also no file changed in the range. A typo or a wrong-case path would
-  otherwise send exactly what it was meant to hold back.
+  anything is sent, in either mode.
+  - "Nothing" means no tracked file, no file changed in the range (delta),
+    and no file anywhere in history.
+  - A typo or a wrong-case path would otherwise send exactly what it was meant
+    to hold back.
+  - `dir/*` is also refused when `dir` has subfolders: under glob rules `*`
+    never crosses `/`, so the nested files would still be sent. Write
+    `dir/**`.
 - **Bad entries are refused.** Malformed entries also stop the run before
   anything is sent: a control character, a backslash, an absolute path, a
   leading `./`, a `..` segment, a leading `:` (pathspec magic), or a pattern
   made only of `*` and `/`.
+
+**Deleting or moving protected files: keep the entry.** Removing the entry in
+the same change that deletes or moves the files sends their contents in the
+next delta, as removed lines. Keep the entry until a digest has posted past
+that change. An entry that only matches history does not stop later runs, so
+it can stay.
 
 **What it does not cover.** It is a path filter for this digest, not a
 data-protection boundary for the repository:
@@ -232,11 +250,13 @@ data-protection boundary for the repository:
 - **Chunks repeat the preamble.** Every chunk of a chunked run repeats the
   commit list and the not-shown list, not just the first.
 - **Nothing reviewable means no model call.** When a range changed only
-  excluded files, lockfiles or binaries, the digest posts a heartbeat instead
-  of paying a model to review an empty diff. Like the quiet-period heartbeat it
-  carries no marker, so the cursor stays put and the next run covers those
-  commits again. A repository whose changes are all lockfile bumps for a
-  while gets one heartbeat per run until something reviewable lands.
+  excluded files, lockfiles or binaries, or its changes cancel out, the digest
+  posts a heartbeat instead of paying a model to review an empty diff.
+  - Unlike the quiet-period heartbeat, it carries the delta marker, so the
+    cursor moves past those commits just as a normal digest would.
+  - It never carries the digest header, so carried findings are untouched.
+  - A full scan that finds nothing to read after the settings also posts a
+    heartbeat instead of calling the model.
 
 **Pinning order.** A caller that passes `exclude_paths` to a hub version that
 does not declare it fails when the workflow loads. Add the input in the same
@@ -273,7 +293,7 @@ Loud fallbacks, never quiet ones:
 - Model or plumbing failure: exit 1, post nothing. A hollow digest would advance
   the cursor over an unreviewed range.
 - Commits in range, but nothing reviewable once excluded paths, lockfiles and
-  binaries are left out: a heartbeat with **no** marker and **no** API call.
+  binaries are left out: a heartbeat **with** a marker and **no** API call.
 - `finish_reason=length`: posts **with** a truncation banner. Disclosed partial
   coverage beats silence.
 

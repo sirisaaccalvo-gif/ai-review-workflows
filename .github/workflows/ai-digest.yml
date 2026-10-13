@@ -133,7 +133,7 @@ on:
         type: string
         required: false
       exclude_paths:
-        description: "Comma separated git glob patterns from the repo root (e.g. 'research/**,docs/previews/**/*.html') whose contents this digest does not send, in delta or full mode, including both sides of a rename across the boundary. The review lists the skipped files by name. An entry that matches nothing stops the run. Default empty."
+        description: "Comma separated git glob patterns from the repo root (e.g. 'research/**,docs/previews/**/*.html') whose contents this digest does not send, in delta or full mode, including both sides of a detected rename across the boundary. The review lists the skipped files by name. An entry that matches nothing, now or in history, stops the run. Default empty."
         type: string
         required: false
       prompt_extra:
@@ -577,7 +577,7 @@ jobs:
           # original design assumed it could do.
           CENTRAL_REPO: ${{ steps.cfg.outputs.central_repo }}
           CENTRAL_REF: ${{ steps.cfg.outputs.central_ref }}
-          EXPECTED_ASSETS_SHA256: '6c1a38a8b2c1323bd3248b343367d10f8c8ebedc1050c7465da507ec17fa2143'
+          EXPECTED_ASSETS_SHA256: '5d920fcc367677a6b7d30c6181109a73f50c41ae58dc2a4282f082cb0d7ecae8'
         run: |
           set -euo pipefail
           missing=0

@@ -830,6 +830,7 @@ jobs:
             mkdir -p src secret research docs assets
             printf 'export const v = 1\n' > src/app.mjs
             printf 'SECRETBASE\n' > secret/plan.md
+            mkdir -p secret/deep && printf 'DEEPSECRET\n' > secret/deep/x.md
             printf '{"old": true}\n' > research/old.json
             printf 'DOCSMARKER\n' > docs/guide.md
             printf '{"name":"fx"}\n' > package.json
@@ -856,12 +857,37 @@ jobs:
           printf 'MOVEDIN line1\nline2\nline3\n' > src/notes.md
           printf 'MOVEDOUT a\nb\nc\n' > secret/old.md
           printf 'GONESECRET\n' > secret/gone.md
+          for k in 1 2 3 4 5 6 7 8 9 10; do echo "HEAVYIN $k"; done > src/heavy.md
           git add -A && GIT_AUTHOR_DATE="$old" GIT_COMMITTER_DATE="$old" git commit -qm "more base"
+          # Moved in and rewritten below git's 50% rename cut-off: not paired, so
+          # only --irreversible-delete keeps the old lines out.
+          git mv src/heavy.md secret/heavy.md
+          { echo "HEAVYIN 1"; echo "HEAVYIN 2"; for k in 1 2 3 4 5 6 7 8; do echo "REWRITTEN $k"; done; } > secret/heavy.md
+          # Names that would break out of a list item if not escaped.
+          printf 'WEIRDSECRET\n' > "secret/we\`ird.md"
+          printf 'WEIRDSECRET\n' > "$(printf 'secret/n\nl.md')"
           git mv src/notes.md secret/notes.md
           git mv secret/old.md src/old.md
           git rm -q secret/gone.md
           printf 'export const v = 3 // RENAMECODE\n' > src/app.mjs
           finish "moves across the boundary"
+
+          # Fixture 4: an excluded folder deleted before the range. The entry matches
+          # nothing now and nothing in range, but it did in history: not a typo.
+          mkrepo "$x/fh"
+          mkdir -p vault && printf 'VAULTSECRET\n' > vault/old.md
+          git add -A && GIT_AUTHOR_DATE="$old" GIT_COMMITTER_DATE="$old" git commit -qm "vault"
+          git rm -rq vault && GIT_AUTHOR_DATE="$old" GIT_COMMITTER_DATE="$old" git commit -qm "drop vault"
+          printf 'export const v = 4 // HISTCODE\n' > src/app.mjs
+          finish "after the vault"
+
+          # Fixture 5: a move into an excluded folder whose old name is not UTF-8.
+          mkrepo "$x/fu"
+          for k in 1 2 3 4 5 6; do echo "LATIN1 $k"; done > "src/caf$(printf '\351').md"
+          git add -A && GIT_AUTHOR_DATE="$old" GIT_COMMITTER_DATE="$old" git commit -qm "latin1"
+          git mv "src/caf$(printf '\351').md" secret/
+          printf 'export const v = 5\n' > src/app.mjs
+          finish "move a latin1 name"
 
           # Fixture 2: a range that changes only excluded files and a lockfile.
           mkrepo "$x/fq"
@@ -893,6 +919,7 @@ jobs:
           has "$x/d1.prompt" "- \`research/dump.json\` (excluded by this repository's exclude_paths)" "an added excluded file is named"
           has "$x/d1.prompt" "- \`package-lock.json\` (lockfile)" "the lockfile is named"
           has "$x/d1.prompt" "- \`assets/pic.png\` (binary extension)" "the binary file is named"
+          has "$x/d1.prompt" 'deleted files show only their header' "the diff heading discloses -D"
           has "$x/d1.out" "2 changed file(s) not sent because of this repository's \`exclude_paths\`" "the header note"
           has "$x/d1.out" '<!-- ai-digest mode=delta base=' "the cursor marker"
           echo "::endgroup::"
@@ -913,13 +940,16 @@ jobs:
           has "$x/f1.prompt" CODECHANGE "full mode still reads code"
           has "$x/f1.prompt" '## Tracked files not shown' "the full-mode not-shown section"
           has "$x/f1.prompt" "- \`secret/plan.md\` (excluded by this repository's exclude_paths)" "an excluded tracked file is named"
-          has "$x/f1.out" "1 tracked file(s) not sent because of this repository's \`exclude_paths\`" "the full-mode header note"
+          has "$x/f1.out" "2 tracked file(s) not sent because of this repository's \`exclude_paths\`" "the full-mode header note"
           DIGEST_INCLUDE_DOCS=true run "$x/fx" full 'docs/**' "$x/f2" || { cat "$x/f2.out"; exit 1; }
           lacks "$x/f2.prompt" DOCSMARKER "include_docs overrode exclude_paths"
           has "$x/f2.prompt" SECRETNEW "full mode reads unexcluded files"
           run "$x/fx" full '' "$x/f0" || { cat "$x/f0.out"; exit 1; }
           has "$x/f0.prompt" SECRETNEW "without the setting, full mode reads the file"
           lacks "$x/f0.prompt" 'Tracked files not shown' "no full-mode section without the setting"
+          run "$x/fx" full 'src/**,secret/**,research/**,package.json' "$x/fe" || { cat "$x/fe.out"; exit 1; }
+          has "$x/fe.out" 'Nothing reviewable: a full scan' "a full scan with nothing left posts a heartbeat"
+          [ ! -s "$x/fe.prompt" ] || { echo "::error::a full prompt was composed with nothing to read"; exit 1; }
           echo "::endgroup::"
 
           echo "::group::malformed entries fail before anything is sent, for the right reason"
@@ -938,6 +968,7 @@ jobs:
           reject './**' 'starts with "./"'
           reject 'secret\**' 'contains a backslash'
           reject "$(printf 'secret/**\tx')" 'contains a control character'
+          reject 'secret/*' 'covers only the top level'
           echo "  rejected every malformed entry with its own reason"
           echo "::endgroup::"
 
@@ -948,6 +979,10 @@ jobs:
             [ ! -s "$x/typo.prompt" ] || { echo "::error::a prompt was composed despite the typo ($mode)"; exit 1; }
           done
           echo "  a typo or wrong-case entry stops both modes before anything is sent"
+          run "$x/fh" delta 'vault/**' "$x/h" || { echo "::error::an entry that matched only in history stopped the run"; cat "$x/h.out"; exit 1; }
+          has "$x/h.prompt" HISTCODE "the run goes on"
+          if run "$x/fh" delta 'vualt/**' "$x/h2"; then echo "::error::a typo was accepted"; exit 1; fi
+          has "$x/h2.out" 'now or earlier in history' "a typo still stops the run"
           echo "::endgroup::"
 
           echo "::group::moves across the boundary and deletions"
@@ -959,12 +994,20 @@ jobs:
           has "$x/r.prompt" "- \`src/notes.md\` (renamed to or from an excluded path)" "the far side of a move in"
           has "$x/r.prompt" "- \`src/old.md\` (renamed to or from an excluded path)" "the far side of a move out"
           has "$x/r.prompt" "- \`secret/gone.md\` (excluded by this repository's exclude_paths)" "the deleted file is named"
+          lacks "$x/r.prompt" HEAVYIN "a heavily edited move into an excluded path leaked its old contents"
+          lacks "$x/r.prompt" WEIRDSECRET "an oddly named excluded file leaked"
+          has "$x/r.prompt" '- `secret/we\`ird.md` (excluded' "a backtick in a name is escaped"
+          has "$x/r.prompt" '- `secret/n\nl.md` (excluded' "a newline in a name is escaped"
+          if run "$x/fu" delta 'secret/**' "$x/u"; then echo "::error::a move with a non-UTF-8 name ran"; exit 1; fi
+          has "$x/u.out" 'not valid UTF-8' "the non-UTF-8 refusal"
+          [ ! -s "$x/u.prompt" ] || { echo "::error::a prompt was composed for the non-UTF-8 move"; exit 1; }
           echo "::endgroup::"
 
-          echo "::group::nothing reviewable: no model call, no cursor"
+          echo "::group::nothing reviewable: no model call, cursor moves"
           run "$x/fq" delta 'secret/**' "$x/q" || { cat "$x/q.out"; exit 1; }
           has "$x/q.out" 'Nothing reviewable' "the heartbeat"
-          lacks "$x/q.out" '<!-- ai-digest mode=delta base=' "a heartbeat must not move the cursor"
+          has "$x/q.out" '<!-- ai-digest mode=delta base=' "the nothing-reviewable heartbeat moves the cursor"
+          lacks "$x/q.out" '## 🤖 AI digest' "a heartbeat must not carry the digest header (carried findings)"
           [ ! -s "$x/q.prompt" ] || { echo "::error::a prompt was composed with nothing to review"; exit 1; }
           echo "::endgroup::"
 

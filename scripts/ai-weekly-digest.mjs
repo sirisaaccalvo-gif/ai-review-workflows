@@ -794,6 +794,12 @@ async function callModel(user, attempt = 1) {
           // stream's final chunk carries the token counts.
           stream: true,
           stream_options: { include_usage: true },
+          // OpenAI documents Chat Completions as "stored by default for new
+          // accounts" (developers.openai.com/api/docs/guides/migrate-to-responses,
+          // checked 2026-10-14), so without this the documented rollback (delete
+          // delta_api) would quietly start keeping every reviewed diff. Sent
+          // only to OpenAI's host, the provider that documents that default.
+          ...(new URL(MODEL.base).hostname === 'api.openai.com' ? { store: false } : {}),
           messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: user }],
         }
     const res = await fetch(`${MODEL.base}/${API === 'responses' ? 'responses' : 'chat/completions'}`, {

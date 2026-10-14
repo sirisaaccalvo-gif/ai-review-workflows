@@ -158,8 +158,12 @@ their choosing, and the digest output would look entirely normal while doing it.
 
 ### `delta_api` / `full_api`: Chat Completions or the Responses API
 
-`chat`, the default, is the only path older pins have. `responses` sends the same
-review to OpenAI's Responses API instead: the system prompt becomes
+`chat`, the default, is the only path older pins have. On OpenAI it also sends
+`store: false`, because OpenAI's migration guide says "Chat Completions are stored
+by default for new accounts" (checked 2026-10-14); older pins send no `store`
+field on OpenAI Chat Completions. Moonshot requests are unchanged.
+
+`responses` sends the same review to OpenAI's Responses API instead: the system prompt becomes
 `instructions`, the effort becomes `reasoning.effort`, the output ceiling becomes
 `max_output_tokens`, and `store: false` keeps the reviewed diff out of stored
 responses. It is a closed enum like `*_provider`, and `responses` is refused with
